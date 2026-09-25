@@ -18,6 +18,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <assert.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "downloadcore.h"
 
 /* 布局必须与 Rust 侧一致；对不上就编译报错，避免"静默内存错乱"。 */
@@ -26,6 +29,11 @@ static_assert(sizeof(dc_request) == 48, "dc_request layout mismatch");
 static_assert(sizeof(dc_config) == 64, "dc_config layout mismatch");
 
 static FILE* g_log = NULL;
+
+#ifdef _WIN32
+static UINT g_old_cp = 0;
+static void restore_console_cp(void) { SetConsoleOutputCP(g_old_cp); }
+#endif
 
 static void ts_now(char* out, size_t n) {
     time_t t = time(NULL);
@@ -130,6 +138,13 @@ int main(int argc, char** argv) {
     char line[4096];
     dc_engine* e = NULL;
     int rc = 0;
+
+#ifdef _WIN32
+    /* 控制台默认是 936 码页，直接输出 UTF-8 会乱码；临时切 UTF-8，退出时还原 */
+    g_old_cp = GetConsoleOutputCP();
+    SetConsoleOutputCP(CP_UTF8);
+    atexit(restore_console_cp);
+#endif
 
     /* 打开日志：新文件写 UTF-8 BOM，方便记事本识别中文 */
     {
