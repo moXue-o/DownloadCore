@@ -17,6 +17,26 @@ cargo build --release
 
 TLS 走**系统实现**（Windows 下为 Schannel），因此不需要 nasm/cmake，也不依赖 OpenSSL。
 
+## 示例程序（演示宿主怎么调用）
+
+```bash
+cargo run --bin get              # 交互式：提示输入网址
+cargo run --bin get -- <网址>     # 直接下载
+cargo run --bin get -- -v         # 只看版本
+# 在提示后输入 selftest 可不联网自检
+```
+
+它明确演示了宿主集成的三个动作：
+
+1. `Config` + `Engine::new(cfg)` 造引擎；
+2. 把 URL / 落盘位置装进 `Request`；
+3. 挂 `Callbacks`（`on_progress` / `on_status` / `on_log`）后调用 `engine.download(...)`。
+
+引擎只给"原始累计字节 + 瞬时速度"，**平滑与显示由宿主决定**。
+详细日志写到当前目录的 `download.log`（带 UTF-8 BOM，记事本不乱码）。
+
+编译出可执行文件：`cargo build --bin get` → `target/debug/get.exe`。
+
 ## 目录结构
 
 | 文件 | 作用 |
