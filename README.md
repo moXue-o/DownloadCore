@@ -15,7 +15,6 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `小本本.md` | 设计经验与取舍：优点清单、避坑、实测结论 |
 | `core-go/` | Go 验证版（实现 + 测试 + 测试程序），详见 `core-go/README.md` |
 | `core-rs/` | Rust 版（`staticlib` + 未来 C ABI），详见 `core-rs/README.md` |
 
