@@ -39,8 +39,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            initial_threads: 64,
-            max_threads: 64,
+            initial_threads: 32,
+            max_threads: 32,
             min_part_size: 1 << 20, // 1 MiB
             buffer_size: 256 << 10,
             idle_timeout: Duration::from_secs(15),

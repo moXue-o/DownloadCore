@@ -9,7 +9,6 @@
 
 # Rust 构建产物
 target/
-build-stamp.txt
 
 # 其它临时文件
 *.tmp
