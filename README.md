@@ -6,25 +6,33 @@
 不含界面、队列、浏览器扩展、托盘、通知等任何"软件外壳"。
 
 **路线**：Go 验证 → Rust 重写 → C ABI（编译期吸收进宿主）。
-当前处于 **Go 验证完成** 阶段，并已实测跑满服务器带宽上限。
+
+**当前进度**：
+- Go 验证版完成，已实测跑满服务器带宽上限（与 ABDM / curl 一致，约 9 MB/s）。
+- Rust 版已实现并通过测试，产出 `staticlib`；C ABI 层待补。
 
 ## 目录结构
 
 | 路径 | 说明 |
 | --- | --- |
+| `小本本.md` | 设计经验与取舍：优点清单、避坑、实测结论 |
 | `core-go/` | Go 验证版（实现 + 测试 + 测试程序），详见 `core-go/README.md` |
+| `core-rs/` | Rust 版（`staticlib` + 未来 C ABI），详见 `core-rs/README.md` |
 
 ## 快速开始
 
+**Go 验证版**
+
 ```bash
 cd core-go
-go test ./...            # 跑测试
-go run ./cmd/get         # 交互式下载测试程序
+go test ./...
+go run ./cmd/get          # 交互式下载测试程序
 ```
 
-编译可执行程序（含版本号注入）：
+**Rust 版**
 
-```powershell
-cd core-go
-.\build.ps1
+```bash
+cd core-rs
+cargo test
+cargo build               # 产出 staticlib
 ```

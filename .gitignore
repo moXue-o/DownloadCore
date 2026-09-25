@@ -7,6 +7,9 @@
 # 下载引擎的临时目录（分段临时文件、续传记录）
 .download-temp/
 
+# Rust 构建产物
+target/
+
 # 其它临时文件
 *.tmp
 
