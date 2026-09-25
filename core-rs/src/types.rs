@@ -53,6 +53,8 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     /// 外部取消标志：置为 true 即中止下载（已下进度保留，供续传）
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 外部暂停标志：置为 true 即暂停（连接保持，恢复后继续），可从别的线程调用
+    pub pause: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// 下载成功后的结果。

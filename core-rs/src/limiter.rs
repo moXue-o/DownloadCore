@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use crate::util::Lock;
 use std::time::{Duration, Instant};
 
 struct Inner {
@@ -10,7 +10,7 @@ struct Inner {
 pub struct Limiter {
     max_speed: u64,
     burst: f64,
-    inner: Mutex<Inner>,
+    inner: Lock<Inner>,
 }
 
 impl Limiter {
@@ -19,7 +19,7 @@ impl Limiter {
         Limiter {
             max_speed,
             burst,
-            inner: Mutex::new(Inner { tokens: burst, last: Instant::now() }),
+            inner: Lock::new(Inner { tokens: burst, last: Instant::now() }),
         }
     }
 
@@ -33,7 +33,7 @@ impl Limiter {
             if canceled() {
                 return Err(());
             }
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock();
             let now = Instant::now();
             let elapsed = now.duration_since(g.last).as_secs_f64();
             g.last = now;

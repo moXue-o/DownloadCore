@@ -11,7 +11,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <assert.h>
 #include "downloadcore.h"
+
+/* 布局必须与 Rust 侧一致；对不上就编译报错，避免"静默内存错乱"。 */
+static_assert(sizeof(dc_progress) == 32, "dc_progress layout mismatch");
+static_assert(sizeof(dc_request) == 48, "dc_request layout mismatch");
+static_assert(sizeof(dc_config) == 64, "dc_config layout mismatch");
 
 static void on_progress(void* ud, const dc_progress* p) {
     static int tick = 0;

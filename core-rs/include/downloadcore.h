@@ -91,6 +91,10 @@ void       dc_engine_free(dc_engine* engine);
 /* 请求取消（可从另一个线程调用） */
 void dc_engine_cancel(dc_engine* engine);
 
+/* 暂停 / 恢复（连接保持，可从另一个线程调用） */
+void dc_engine_pause(dc_engine* engine);
+void dc_engine_resume(dc_engine* engine);
+
 /*
  * 同步下载。返回 0 成功；非 0 失败（*err_msg 为错误信息，需 dc_string_free）。
  * out_path 需 dc_string_free；out_size/out_speed/out_parts 可为 NULL。

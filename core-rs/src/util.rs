@@ -120,3 +120,18 @@ pub fn pad_from(from: i64) -> String {
 pub fn part_file_name(dir: &Path, from: i64) -> PathBuf {
     dir.join(pad_from(from))
 }
+
+use std::sync::{Mutex, MutexGuard};
+
+/// 容错加锁：即使别的线程 panic 导致锁"中毒"，也取回内部数据，而不是跟着 panic。
+/// 用它替换裸 `Mutex`，可消除一大类 `unwrap` 崩溃点。
+pub struct Lock<T>(Mutex<T>);
+
+impl<T> Lock<T> {
+    pub fn new(v: T) -> Self {
+        Lock(Mutex::new(v))
+    }
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}

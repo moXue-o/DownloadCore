@@ -6,13 +6,13 @@ use crate::part::{Part, SAFETY_STEP};
 use crate::split::split_to_range;
 use crate::store::{self, PartState, ResumeState, STATE_FILE_NAME};
 use crate::types::{Callbacks, DownloadResult, Progress, Request, Status};
-use crate::util::{filename_from_url, job_key, part_file_name, sanitize_name};
+use crate::util::{filename_from_url, job_key, part_file_name, sanitize_name, Lock};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SLOW_WINDOW: Duration = Duration::from_secs(5);
@@ -27,35 +27,39 @@ const FAIR_RATE: f64 = 150.0 * 1024.0;
 /// 下载核心。只负责把一个 URL 下成一个文件。
 pub struct Engine {
     cfg: Config,
+    rt: tokio::runtime::Runtime,
 }
 
 impl Engine {
     pub fn new(cfg: Config) -> Self {
-        Engine { cfg: cfg.normalized() }
+        let cfg = cfg.normalized();
+        // 运行时只建一次，反复下载复用（避免每次重建线程池的开销）
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(cfg.max_threads.clamp(4, 64))
+            .enable_all()
+            .build()
+            .expect("无法创建 tokio 运行时");
+        Engine { cfg, rt }
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
     }
 
-    /// 下载一个文件。阻塞式接口；cancellation 通过 Callbacks 之外的共享标志暂不暴露。
+    /// 下载一个文件。阻塞式接口。
+    /// 取消 / 暂停通过 `Request` 里的共享标志（可从别的线程调用）。
     pub fn download(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {
         if req.url.is_empty() {
             return Err(fatal("request", "URL 为空"));
         }
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(self.cfg.max_threads.clamp(4, 64))
-            .enable_all()
-            .build()
-            .map_err(|e| fatal("runtime", format!("创建运行时失败: {e}")))?;
-        rt.block_on(self.run(req, cbs))
+        self.rt.block_on(self.run(req, cbs))
     }
 
     async fn run(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {
         let http = Arc::new(HttpClient::new(&self.cfg)?);
         let limiter = Arc::new(Limiter::new(self.cfg.max_speed));
-        let shared = Arc::new(Shared::new(cbs, req.cancel.clone()));
-        *shared.req_url.lock().unwrap() = req.url.clone();
+        let shared = Arc::new(Shared::new(cbs, req.cancel.clone(), req.pause.clone()));
+        *shared.req_url.lock() = req.url.clone();
         let start = Instant::now();
 
         shared.status(Status::Probing);
@@ -68,8 +72,8 @@ impl Engine {
         };
         let size = pi.size.max(0);
         shared.total.store(size, Ordering::SeqCst);
-        *shared.etag.lock().unwrap() = pi.etag.clone();
-        *shared.last_mod.lock().unwrap() = pi.last_modified.clone();
+        *shared.etag.lock() = pi.etag.clone();
+        *shared.last_mod.lock() = pi.last_modified.clone();
 
         // 确定最终路径
         let (final_path, temp_dir) = self.setup_paths(&req, &pi)?;
@@ -130,7 +134,7 @@ impl Engine {
             if shared.is_canceled() {
                 break;
             }
-            if shared.first_err.lock().unwrap().is_some() {
+            if shared.first_err.lock().is_some() {
                 shared.cancel.store(true, Ordering::SeqCst);
                 break;
             }
@@ -150,7 +154,7 @@ impl Engine {
             }
             // 用空闲名额补工人
             while joinset.len() < self.cfg.max_threads {
-                let next = { shared.queue.lock().unwrap().pop_front() };
+                let next = { shared.queue.lock().pop_front() };
                 let part = match next {
                     Some(p) => p,
                     None => match split_one(&shared, &self.cfg) {
@@ -169,7 +173,7 @@ impl Engine {
                     part,
                 );
             }
-            if joinset.is_empty() && shared.queue.lock().unwrap().is_empty() {
+            if joinset.is_empty() && shared.queue.lock().is_empty() {
                 break;
             }
             match tokio::time::timeout(Duration::from_millis(200), joinset.join_next()).await {
@@ -183,7 +187,7 @@ impl Engine {
             }
         }
 
-        if let Some(e) = shared.first_err.lock().unwrap().take() {
+        if let Some(e) = shared.first_err.lock().take() {
             shared.save_state(&temp_dir);
             shared.logf("ERROR", format!("任务失败：{e}"));
             shared.status(Status::Failed);
@@ -197,7 +201,7 @@ impl Engine {
         }
 
         // 全部下完 → 拼装
-        let parts_snapshot: Vec<Part> = { shared.parts.lock().unwrap().iter().map(|p| p.lock().unwrap().clone()).collect() };
+        let parts_snapshot: Vec<Part> = { shared.parts.lock().iter().map(|p| p.lock().clone()).collect() };
         let n_segments = parts_snapshot.len();
         let ranges = crate::assemble::parts_for_assemble(&parts_snapshot);
         shared.logf(
@@ -290,15 +294,15 @@ impl Engine {
                 && !st.parts.is_empty()
                 && part_files_usable(temp_dir, &st.parts)
             {
-                let mut parts = shared.parts.lock().unwrap();
-                let mut queue = shared.queue.lock().unwrap();
+                let mut parts = shared.parts.lock();
+                let mut queue = shared.queue.lock();
                 for ps in &st.parts {
                     if ps.from < 0 || ps.to >= pi.size || ps.current < ps.from {
                         continue;
                     }
                     let p = Part::new_with(ps.from, ps.to, ps.current.min(ps.to + 1));
-                    let arc = Arc::new(Mutex::new(p));
-                    if !arc.lock().unwrap().done() {
+                    let arc = Arc::new(Lock::new(p));
+                    if !arc.lock().done() {
                         queue.push_back(arc.clone());
                     }
                     parts.push(arc);
@@ -322,10 +326,10 @@ impl Engine {
             vec![(0, pi.size - 1)]
         };
         {
-            let mut parts = shared.parts.lock().unwrap();
-            let mut queue = shared.queue.lock().unwrap();
+            let mut parts = shared.parts.lock();
+            let mut queue = shared.queue.lock();
             for (from, to) in &ranges {
-                let arc = Arc::new(Mutex::new(Part::new(*from, *to)));
+                let arc = Arc::new(Lock::new(Part::new(*from, *to)));
                 parts.push(arc.clone());
                 queue.push_back(arc);
             }
@@ -375,6 +379,10 @@ impl Engine {
             if shared.is_canceled() {
                 return Err(Error::canceled());
             }
+            if shared.is_paused() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             match resp.chunk().await {
                 Ok(Some(b)) => {
                     file.write_all(&b).map_err(|e| fatal("write", format!("{e}")))?;
@@ -391,22 +399,23 @@ impl Engine {
 
 /// 一次下载任务的共享状态。
 struct Shared {
-    req_url: Mutex<String>,
+    req_url: Lock<String>,
     cbs: Callbacks,
-    parts: Mutex<Vec<Arc<Mutex<Part>>>>,
-    queue: Mutex<VecDeque<Arc<Mutex<Part>>>>,
-    first_err: Mutex<Option<Error>>,
+    parts: Lock<Vec<Arc<Lock<Part>>>>,
+    queue: Lock<VecDeque<Arc<Lock<Part>>>>,
+    first_err: Lock<Option<Error>>,
     downloaded: AtomicI64,
     cancel: AtomicBool,
     external: Option<Arc<AtomicBool>>,
+    external_pause: Option<Arc<AtomicBool>>,
     total: AtomicI64,
     // 整体速度（字节/秒）与活跃连接数，供"相对判断"使用
     global_rate: AtomicI64,
     active: AtomicUsize,
-    etag: Mutex<String>,
-    last_mod: Mutex<String>,
-    prog: Mutex<ProgState>,
-    log_mu: Mutex<()>,
+    etag: Lock<String>,
+    last_mod: Lock<String>,
+    prog: Lock<ProgState>,
+    log_mu: Lock<()>,
 }
 
 struct ProgState {
@@ -415,28 +424,29 @@ struct ProgState {
 }
 
 impl Shared {
-    fn new(cbs: Callbacks, external: Option<Arc<AtomicBool>>) -> Self {
+    fn new(cbs: Callbacks, external: Option<Arc<AtomicBool>>, external_pause: Option<Arc<AtomicBool>>) -> Self {
         Shared {
-            req_url: Mutex::new(String::new()),
+            req_url: Lock::new(String::new()),
             cbs,
-            parts: Mutex::new(Vec::new()),
-            queue: Mutex::new(VecDeque::new()),
-            first_err: Mutex::new(None),
+            parts: Lock::new(Vec::new()),
+            queue: Lock::new(VecDeque::new()),
+            first_err: Lock::new(None),
             downloaded: AtomicI64::new(0),
             cancel: AtomicBool::new(false),
             external,
+            external_pause,
             total: AtomicI64::new(0),
             global_rate: AtomicI64::new(0),
             active: AtomicUsize::new(0),
-            etag: Mutex::new(String::new()),
-            last_mod: Mutex::new(String::new()),
-            prog: Mutex::new(ProgState { last_emit: Instant::now(), last_emit_bytes: 0 }),
-            log_mu: Mutex::new(()),
+            etag: Lock::new(String::new()),
+            last_mod: Lock::new(String::new()),
+            prog: Lock::new(ProgState { last_emit: Instant::now(), last_emit_bytes: 0 }),
+            log_mu: Lock::new(()),
         }
     }
 
     fn url(&self) -> String {
-        self.req_url.lock().unwrap().clone()
+        self.req_url.lock().clone()
     }
 
     fn is_canceled(&self) -> bool {
@@ -448,6 +458,13 @@ impl Shared {
                 .unwrap_or(false)
     }
 
+    fn is_paused(&self) -> bool {
+        self.external_pause
+            .as_ref()
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
     fn status(&self, s: Status) {
         if let Some(cb) = &self.cbs.on_status {
             cb(s);
@@ -456,7 +473,7 @@ impl Shared {
 
     fn logf(&self, level: &'static str, msg: impl Into<String>) {
         if let Some(cb) = &self.cbs.on_log {
-            let _g = self.log_mu.lock().unwrap();
+            let _g = self.log_mu.lock();
             cb(crate::types::LogEntry { level, message: msg.into() });
         }
     }
@@ -465,7 +482,7 @@ impl Shared {
         let total = self.downloaded.fetch_add(n, Ordering::SeqCst) + n;
         let Some(cb) = &self.cbs.on_progress else { return };
         let now = Instant::now();
-        let mut g = self.prog.lock().unwrap();
+        let mut g = self.prog.lock();
         if now.duration_since(g.last_emit) < Duration::from_millis(200) {
             return;
         }
@@ -475,7 +492,7 @@ impl Shared {
         g.last_emit_bytes = total;
         drop(g);
         let speed = if dt > 0.0 { (delta as f64 / dt) as i64 } else { 0 };
-        let parts = self.parts.lock().unwrap().len();
+        let parts = self.parts.lock().len();
         cb(Progress { downloaded: total, total: self.total.load(Ordering::SeqCst), speed, parts });
     }
 
@@ -483,10 +500,9 @@ impl Shared {
         let parts: Vec<PartState> = self
             .parts
             .lock()
-            .unwrap()
             .iter()
             .map(|p| {
-                let p = p.lock().unwrap();
+                let p = p.lock();
                 let mut cur = p.current;
                 if cur > p.to {
                     cur = p.to + 1;
@@ -498,8 +514,8 @@ impl Shared {
             version: 1,
             url: self.url(),
             total: self.total.load(Ordering::SeqCst),
-            etag: self.etag.lock().unwrap().clone(),
-            last_modified: self.last_mod.lock().unwrap().clone(),
+            etag: self.etag.lock().clone(),
+            last_modified: self.last_mod.lock().clone(),
             parts,
         };
         if let Err(e) = store::save_state_file(&temp_dir.join(STATE_FILE_NAME), &st) {
@@ -541,15 +557,15 @@ fn part_files_usable(temp_dir: &Path, states: &[PartState]) -> bool {
 }
 
 /// 从所有段里挑"剩下活最多"的那段来分裂。
-fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Mutex<Part>>> {
+fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
     let min_delta = cfg.min_part_size.max(SAFETY_STEP);
     // 先选出目标段（锁的作用域到 block 结束就释放，避免重复加锁死锁）
     let best = {
-        let parts = shared.parts.lock().unwrap();
-        let mut best: Option<Arc<Mutex<Part>>> = None;
+        let parts = shared.parts.lock();
+        let mut best: Option<Arc<Lock<Part>>> = None;
         let mut best_delta = 0i64;
         for p in parts.iter() {
-            let d = p.lock().unwrap().splittable_delta();
+            let d = p.lock().splittable_delta();
             if d >= min_delta && d > best_delta {
                 best_delta = d;
                 best = Some(p.clone());
@@ -558,10 +574,10 @@ fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Mutex<Part>>> {
         best
     };
     let best = best?;
-    let np = best.lock().unwrap().split_at_least(min_delta)?;
+    let np = best.lock().split_at_least(min_delta)?;
     let (from, to) = (np.from, np.to);
-    let arc = Arc::new(Mutex::new(np));
-    shared.parts.lock().unwrap().push(arc.clone());
+    let arc = Arc::new(Lock::new(np));
+    shared.parts.lock().push(arc.clone());
     shared.logf("INFO", format!("动态分段：拆分最大段，新增 [{from}..={to}]"));
     Some(arc)
 }
@@ -574,7 +590,7 @@ fn spawn_part(
     cfg: &Config,
     req: &Request,
     temp_dir: &Path,
-    part: Arc<Mutex<Part>>,
+    part: Arc<Lock<Part>>,
 ) {
     let s = shared.clone();
     let h = http.clone();
@@ -584,7 +600,7 @@ fn spawn_part(
     let headers = req.headers.clone();
     let dir = temp_dir.to_path_buf();
     let (from, to) = {
-        let p = part.lock().unwrap();
+        let p = part.lock();
         (p.from, p.to)
     };
     s.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
@@ -595,7 +611,7 @@ fn spawn_part(
             Err(e) if e.kind == ErrorKind::Canceled => {}
             Err(e) => {
                 s.logf("WARN", format!("工人结束（出错）：段 [{from}, {to}]，错误={e}"));
-                let mut fe = s.first_err.lock().unwrap();
+                let mut fe = s.first_err.lock();
                 if fe.is_none() {
                     *fe = Some(e);
                 }
@@ -614,7 +630,7 @@ async fn run_part(
     url: &str,
     headers: &[(String, String)],
     temp_dir: &Path,
-    part: &Arc<Mutex<Part>>,
+    part: &Arc<Lock<Part>>,
 ) -> Result<()> {
     let mut last_err: Option<Error> = None;
     for attempt in 0..=cfg.max_retries {
@@ -625,12 +641,12 @@ async fn run_part(
             tokio::time::sleep(cfg.retry_delay).await;
         }
         let (from, to, cur) = {
-            let p = part.lock().unwrap();
+            let p = part.lock();
             (p.from, p.to, p.current)
         };
         match download_part_once(shared, http, limiter, cfg, url, headers, temp_dir, part).await {
             Ok(()) => {
-                if part.lock().unwrap().done() {
+                if part.lock().done() {
                     return Ok(());
                 }
                 last_err = Some(retryable("part", "连接提前结束"));
@@ -659,14 +675,14 @@ async fn download_part_once(
     url: &str,
     headers: &[(String, String)],
     temp_dir: &Path,
-    part: &Arc<Mutex<Part>>,
+    part: &Arc<Lock<Part>>,
 ) -> Result<()> {
-    let from = part.lock().unwrap().from;
+    let from = part.lock().from;
     let mut file = open_part_file(temp_dir, part)?;
     let mut reconnects = 0usize;
     loop {
         let (to, current) = {
-            let p = part.lock().unwrap();
+            let p = part.lock();
             (p.to, p.current)
         };
         if current > to {
@@ -697,7 +713,7 @@ async fn pump(
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
-    part: &Arc<Mutex<Part>>,
+    part: &Arc<Lock<Part>>,
     file: &mut File,
     mut resp: reqwest::Response,
     watch_slow: bool,
@@ -712,8 +728,15 @@ async fn pump(
         if shared.is_canceled() {
             return Err(Error::canceled());
         }
+        if shared.is_paused() {
+            // 暂停：连接保持、不计数；恢复后继续
+            window_start = Instant::now();
+            window_bytes = 0;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
         let (to, current, safe_zone) = {
-            let p = part.lock().unwrap();
+            let p = part.lock();
             (p.to, p.current, p.safe_zone)
         };
         if current > to {
@@ -721,7 +744,7 @@ async fn pump(
         }
         let allowed = safe_zone + 1 - current;
         if allowed <= 0 {
-            let mut p = part.lock().unwrap();
+            let mut p = part.lock();
             if !p.extend_safe_zone() {
                 if p.current > p.to {
                     return Ok(());
@@ -741,7 +764,7 @@ async fn pump(
                     }
                 }
                 Ok(None) => {
-                    if part.lock().unwrap().done() {
+                    if part.lock().done() {
                         return Ok(());
                     }
                     return Err(retryable("read", "连接提前结束"));
@@ -763,7 +786,7 @@ async fn pump(
         file.write_all(&pending[pending_off..pending_off + n])
             .map_err(|e| fatal("write", format!("{e}")))?;
         pending_off += n;
-        part.lock().unwrap().advance(n as i64);
+        part.lock().advance(n as i64);
         shared.add_downloaded(n as i64);
         window_bytes += n as i64;
         if limiter
@@ -776,7 +799,7 @@ async fn pump(
         if watch_slow && window_start.elapsed() >= SLOW_WINDOW {
             let secs = window_start.elapsed().as_secs_f64();
             let remaining = {
-                let p = part.lock().unwrap();
+                let p = part.lock();
                 p.to - p.current + 1
             };
             if remaining > SLOW_REMAINING_MIN && secs > 0.0 {
@@ -810,9 +833,9 @@ async fn pump(
     }
 }
 
-fn open_part_file(temp_dir: &Path, part: &Arc<Mutex<Part>>) -> Result<File> {
+fn open_part_file(temp_dir: &Path, part: &Arc<Lock<Part>>) -> Result<File> {
     let (from, to) = {
-        let p = part.lock().unwrap();
+        let p = part.lock();
         (p.from, p.to)
     };
     let path = part_file_name(temp_dir, from);

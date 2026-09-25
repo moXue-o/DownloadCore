@@ -75,7 +75,18 @@ pub type dc_log_cb =
 
 pub struct dc_engine {
     engine: Engine,
+    /// 防并发：同一句柄一次只允许一个下载
+    busy: AtomicBool,
     cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+}
+
+/// 进下载时置忙、离开时自动复位（任何提前返回都会复位）。
+struct BusyGuard<'a>(&'a AtomicBool);
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 fn cstr_to_string(p: *const c_char) -> Option<String> {
@@ -200,7 +211,9 @@ pub unsafe extern "C" fn dc_engine_new(cfg: *const dc_config) -> *mut dc_engine 
         }
         Box::into_raw(Box::new(dc_engine {
             engine: Engine::new(c),
+            busy: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
         }))
     }));
     result.unwrap_or(std::ptr::null_mut())
@@ -229,6 +242,30 @@ pub unsafe extern "C" fn dc_engine_cancel(engine: *mut dc_engine) {
     if !engine.is_null() {
         let e = unsafe { &*engine };
         e.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// 暂停当前下载：连接保持，恢复后继续（可从另一个线程调用）。
+///
+/// # Safety
+/// `engine` 必须是有效句柄。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_engine_pause(engine: *mut dc_engine) {
+    if !engine.is_null() {
+        let e = unsafe { &*engine };
+        e.pause.store(true, Ordering::SeqCst);
+    }
+}
+
+/// 恢复被暂停的下载。
+///
+/// # Safety
+/// `engine` 必须是有效句柄。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_engine_resume(engine: *mut dc_engine) {
+    if !engine.is_null() {
+        let e = unsafe { &*engine };
+        e.pause.store(false, Ordering::SeqCst);
     }
 }
 
@@ -262,6 +299,13 @@ pub unsafe extern "C" fn dc_engine_download(
                 return Err("engine/req 为空".to_string());
             }
             let e = unsafe { &*engine };
+            if e.busy.swap(true, Ordering::SeqCst) {
+                return Err("引擎正忙：同一个句柄不支持并发下载".to_string());
+            }
+            let _busy = BusyGuard(&e.busy);
+            // 每次下载前复位取消/暂停标志
+            e.cancel.store(false, Ordering::SeqCst);
+            e.pause.store(false, Ordering::SeqCst);
             let r = unsafe { &*req };
             let url = cstr_to_string(r.url).ok_or_else(|| "URL 为空".to_string())?;
 
@@ -282,6 +326,7 @@ pub unsafe extern "C" fn dc_engine_download(
                 target_dir: cstr_to_string(r.target_dir),
                 headers,
                 cancel: Some(e.cancel.clone()),
+                pause: Some(e.pause.clone()),
             };
 
             let ud = userdata as usize;
@@ -311,7 +356,6 @@ pub unsafe extern "C" fn dc_engine_download(
                 }),
             };
 
-            e.cancel.store(false, Ordering::SeqCst);
             e.engine
                 .download(request, cbs)
                 .map_err(|err| err.to_string())
@@ -344,5 +388,38 @@ pub unsafe extern "C" fn dc_engine_download(
             unsafe { *err_msg = leak_cstring("内部 panic 已被捕获".to_string()) };
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    /// 这些数字必须与 `include/downloadcore.h` 里的 C 结构体一致。
+    /// 任何一边改动导致对不齐，这个测试会先炸出来。
+    #[test]
+    fn c_layout_matches_header() {
+        assert_eq!(align_of::<dc_progress>(), 8);
+        assert_eq!(size_of::<dc_progress>(), 32);
+
+        assert_eq!(align_of::<dc_request>(), 8);
+        assert_eq!(size_of::<dc_request>(), 48);
+        assert_eq!(offset_of!(dc_request, url), 0);
+        assert_eq!(offset_of!(dc_request, target_file), 8);
+        assert_eq!(offset_of!(dc_request, target_dir), 16);
+        assert_eq!(offset_of!(dc_request, header_keys), 24);
+        assert_eq!(offset_of!(dc_request, header_values), 32);
+        assert_eq!(offset_of!(dc_request, header_count), 40);
+
+        assert_eq!(align_of::<dc_config>(), 8);
+        assert_eq!(size_of::<dc_config>(), 64);
+        assert_eq!(offset_of!(dc_config, initial_threads), 0);
+        assert_eq!(offset_of!(dc_config, max_threads), 4);
+        assert_eq!(offset_of!(dc_config, min_part_size), 8);
+        assert_eq!(offset_of!(dc_config, temp_dir), 32);
+        assert_eq!(offset_of!(dc_config, incomplete_suffix), 40);
+        assert_eq!(offset_of!(dc_config, user_agent), 48);
+        assert_eq!(offset_of!(dc_config, max_speed), 56);
     }
 }

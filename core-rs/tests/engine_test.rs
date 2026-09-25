@@ -401,3 +401,37 @@ fn file_changed_on_resume_starts_fresh() {
     // 必须是"新文件"，绝不能新旧内容拼在一起
     assert_eq!(read_file(&res.path), data2);
 }
+
+#[test]
+fn pause_and_resume_completes_correctly() {
+    let data = make_data(4 << 20, 8);
+    let srv = TestServer::new(data.clone());
+    srv.set_speed(2 << 20); // 慢一点，便于中途暂停
+    let dir = unique_dir("pause");
+    let target = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.idle_timeout = Duration::from_secs(5);
+    let engine = Engine::new(cfg);
+
+    let pause = Arc::new(AtomicBool::new(false));
+    let p = pause.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        p.store(true, Ordering::SeqCst); // 暂停
+        thread::sleep(Duration::from_millis(500));
+        p.store(false, Ordering::SeqCst); // 恢复
+    });
+
+    let res = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(target.display().to_string()),
+                pause: Some(pause),
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap();
+    assert_eq!(read_file(&res.path), data);
+}
