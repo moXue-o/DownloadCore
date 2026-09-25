@@ -32,6 +32,8 @@ pub struct Config {
     pub user_agent: String,
     /// 全局限速（字节/秒），0 表示不限
     pub max_speed: u64,
+    /// 是否在系统层面"抢网"：提升进程优先级、关闭省电节流
+    pub os_priority: bool,
 }
 
 impl Default for Config {
@@ -48,6 +50,7 @@ impl Default for Config {
             incomplete_suffix: ".part".to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_speed: 0,
+            os_priority: true,
         }
     }
 }

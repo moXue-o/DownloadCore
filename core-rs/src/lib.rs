@@ -9,6 +9,7 @@ mod config;
 mod engine;
 mod errors;
 mod limiter;
+mod os;
 mod part;
 mod split;
 mod store;

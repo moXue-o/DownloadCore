@@ -58,6 +58,14 @@ impl Engine {
         *shared.req_url.lock().unwrap() = req.url.clone();
         let start = Instant::now();
 
+        if self.cfg.os_priority {
+            if crate::os::raise_process_priority() {
+                shared.logf("INFO", "已提升进程优先级（HIGH）并关闭省电节流，用于抢网");
+            } else {
+                shared.logf("WARN", "无法提升进程优先级，按默认优先级运行");
+            }
+        }
+
         shared.status(Status::Probing);
         let pi = match http.probe(&req.url, &req.headers).await {
             Ok(p) => p,
@@ -616,6 +624,7 @@ async fn run_part(
     temp_dir: &Path,
     part: &Arc<Mutex<Part>>,
 ) -> Result<()> {
+    crate::os::promote_current_thread();
     let mut last_err: Option<Error> = None;
     for attempt in 0..=cfg.max_retries {
         if shared.is_canceled() {
