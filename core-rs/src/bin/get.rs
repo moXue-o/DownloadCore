@@ -24,13 +24,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_STAMP: &str = env!("BUILD_STAMP");
 const LOG_FILE: &str = "download.log";
 
 fn main() {
     // `-v`：只看版本
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-v" || a == "-V" || a == "--version") {
-        println!("简单下载器 v{VERSION}");
+        println!("简单下载器 v{VERSION} (build {BUILD_STAMP})");
         return;
     }
 
@@ -38,7 +39,7 @@ fn main() {
     let log_path = dir.join(LOG_FILE);
 
     println!("==============================================");
-    println!("  简单下载器  v{VERSION}  (下载核心示例)");
+    println!("  简单下载器  v{VERSION}  (build {BUILD_STAMP})");
     println!("==============================================");
     println!("文件保存到：{}", dir.display());
     println!("详细日志：  {}", log_path.display());
@@ -46,7 +47,7 @@ fn main() {
     println!();
 
     let logger = Arc::new(Logger::new(&log_path));
-    logger.log("INFO", &format!("程序启动 v{VERSION}，工作目录={}", dir.display()));
+    logger.log("INFO", &format!("程序启动 v{VERSION} (build {BUILD_STAMP})，工作目录={}", dir.display()));
 
     // 命令行直接给了网址，就下这一个然后退出
     let direct = args.into_iter().find(|a| !a.starts_with('-'));
