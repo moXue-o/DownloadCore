@@ -23,6 +23,8 @@ TLS 走**系统实现**（Windows 下为 Schannel），因此不需要 nasm/cmak
 cargo run --bin get              # 交互式：提示输入网址
 cargo run --bin get -- <网址>     # 直接下载
 cargo run --bin get -- -v         # 只看版本
+cargo run --bin get -- --extreme <网址>   # 极限模式（128 连接 + 系统优先级）
+cargo run --bin get -- --threads 64 <网址> # 自定义并发
 # 在提示后输入 selftest 可不联网自检
 ```
 
@@ -36,6 +38,14 @@ cargo run --bin get -- -v         # 只看版本
 详细日志写到当前目录的 `download.log`（带 UTF-8 BOM，记事本不乱码）。
 
 编译出可执行文件：`cargo build --bin get` → `target/debug/get.exe`。
+
+### 极限模式（Extreme）
+
+`Config::extreme()`（或示例的 `--extreme`）：**128 连接 + 进程 HIGH 优先级 + 关闭省电节流**，用于抢网。
+
+**它是什么**：尽最大合法努力占满共享管道——连接数开满（按流公平的瓶颈下挤占别人）、CPU 优先级拉满（CPU 争抢时先服务自己）、不自我限速、连接满员。
+
+**它不是万能**：如果服务器对我们**按 IP 限速**（如某 CDN 只给 ~9 MB/s）、且本机链路富余，那**无法把其他应用压到 0**——这是物理限制。实测（千兆链路 + 限速服务器）：本机 8/32/64 连接几乎不影响另一进程的速度。极限模式在"小水管 / 路由器 / CPU 争抢"场景才有明显效果。
 
 ## 目录结构
 

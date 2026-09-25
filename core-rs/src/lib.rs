@@ -16,7 +16,7 @@ mod store;
 mod types;
 mod util;
 
-pub use config::{Config, DEFAULT_USER_AGENT};
+pub use config::{Config, Mode, DEFAULT_USER_AGENT};
 pub use engine::Engine;
 pub use errors::{Error, ErrorKind, Result};
 pub use types::{Callbacks, DownloadResult, LogEntry, Progress, Request, Status};

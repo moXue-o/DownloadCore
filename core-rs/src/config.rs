@@ -1,6 +1,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// 下载模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// 常规：均衡使用资源
+    Normal,
+    /// 极限抢网：尽可能多连接 + 系统优先级，尽可能占满共享管道
+    Extreme,
+}
+
 /// 中性客户端身份。
 ///
 /// 实测：把 User-Agent 改成 Chrome 浏览器身份后，部分 CDN 反而返回 403
@@ -34,6 +43,8 @@ pub struct Config {
     pub max_speed: u64,
     /// 是否在系统层面"抢网"：提升进程优先级、关闭省电节流
     pub os_priority: bool,
+    /// 下载模式：Normal / Extreme
+    pub mode: Mode,
 }
 
 impl Default for Config {
@@ -51,6 +62,7 @@ impl Default for Config {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_speed: 0,
             os_priority: true,
+            mode: Mode::Normal,
         }
     }
 }
@@ -83,5 +95,16 @@ impl Config {
             self.user_agent = DEFAULT_USER_AGENT.to_string();
         }
         self
+    }
+
+    /// 极限模式的推荐配置：128 连接 + 系统优先级，用于抢网。
+    /// 注意：仅在"共享管道"是瓶颈时有意义（见 README）。
+    pub fn extreme() -> Config {
+        let mut c = Config::default();
+        c.mode = Mode::Extreme;
+        c.initial_threads = 128;
+        c.max_threads = 128;
+        c.os_priority = true;
+        c
     }
 }
