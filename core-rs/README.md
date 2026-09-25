@@ -72,7 +72,42 @@ cargo run --bin get -- -v         # 只看版本
 - **只用 HTTP/1.1**：多连接比多路复用更适合按连接限速的 CDN。
 - **引擎不管平滑/显示**：只给"累计字节 + 瞬时速度"，平滑交给宿主。
 
+## C ABI（给非 Rust 宿主编译期吸收）
+
+产物：`target/release/downloadcore.lib`（staticlib）+ `include/downloadcore.h`。
+
+宿主集成三步（完整例子见 `cdemo/demo.c`）：
+
+```c
+dc_config cfg = dc_config_default();      /* 按需改字段 */
+dc_engine* e = dc_engine_new(&cfg);
+dc_request req; memset(&req, 0, sizeof(req));
+req.url = "https://...";
+req.target_dir = ".";                      /* 不给文件名就自动取名 */
+dc_engine_download(e, &req, on_progress, on_status, on_log, userdata,
+                   &out_path, &out_size, &out_speed, &out_parts, &err);
+/* 取消（可从别的线程调用）：dc_engine_cancel(e); */
+dc_engine_free(e);
+```
+
+链接时必须带上系统库：
+`ws2_32 userenv bcrypt ntdll advapi32 ole32 shell32 crypt32`。
+
+编译并实跑 C 示例：
+
+```bash
+cd core-rs
+cargo build --release
+cd cdemo && .\build.bat          # 用 MSVC 编译并链接 downloadcore.lib
+# 另开一个窗口起本地服务器：
+#   ..\target\release\serve.exe 64 2121
+.\demo.exe http://127.0.0.1:2121/file.bin .
+```
+
+实测：`demo.exe`（2.4 MB，内含静态链入的核心）成功下载 64 MB 并逐字节正确。
+
 ## 下一步
 
-- C ABI 层（不透明句柄 + 回调 + userdata）与 C 头文件（cbindgen 或手写）。
 - 与 Go 版对齐的参数与行为收口。
+- 小本本"后续更新"里的能力（代理 / 凭据 / 校验和 / 镜像 / 自适应并发）。
+- 跨平台（Linux/macOS）验证。

@@ -8,6 +8,7 @@ mod client;
 mod config;
 mod engine;
 mod errors;
+mod ffi;
 mod limiter;
 mod part;
 mod split;
