@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,10 @@ const SLOW_WINDOW: Duration = Duration::from_secs(5);
 const SLOW_MIN_BYTES: i64 = 512 << 10;
 const SLOW_REMAINING_MIN: i64 = 256 << 10;
 const MAX_SLOW_RECONNECTS: usize = 8;
+// 绝对"卡死"线：低于它就重开（与整体快慢无关）
+const STUCK_RATE: f64 = 20.0 * 1024.0;
+// "公平份额"线：整体每连接超过它，才谈得上"这条被饿着"（避免争抢时误判）
+const FAIR_RATE: f64 = 150.0 * 1024.0;
 
 /// 下载核心。只负责把一个 URL 下成一个文件。
 pub struct Engine {
@@ -119,6 +123,8 @@ impl Engine {
 
         let mut joinset = tokio::task::JoinSet::new();
         let mut last_state_save = Instant::now();
+        let mut rate_t = Instant::now();
+        let mut rate_bytes = 0i64;
 
         loop {
             if shared.is_canceled() {
@@ -127,6 +133,20 @@ impl Engine {
             if shared.first_err.lock().unwrap().is_some() {
                 shared.cancel.store(true, Ordering::SeqCst);
                 break;
+            }
+            // 维护"整体速度 / 活跃连接数"，供慢连接做相对判断
+            {
+                let now = Instant::now();
+                let dt = now.duration_since(rate_t).as_secs_f64();
+                if dt >= 0.5 {
+                    let bytes = shared.downloaded.load(Ordering::SeqCst);
+                    shared
+                        .global_rate
+                        .store(((bytes - rate_bytes) as f64 / dt) as i64, Ordering::SeqCst);
+                    shared.active.store(joinset.len(), Ordering::SeqCst);
+                    rate_t = now;
+                    rate_bytes = bytes;
+                }
             }
             // 用空闲名额补工人
             while joinset.len() < self.cfg.max_threads {
@@ -380,6 +400,9 @@ struct Shared {
     cancel: AtomicBool,
     external: Option<Arc<AtomicBool>>,
     total: AtomicI64,
+    // 整体速度（字节/秒）与活跃连接数，供"相对判断"使用
+    global_rate: AtomicI64,
+    active: AtomicUsize,
     etag: Mutex<String>,
     last_mod: Mutex<String>,
     prog: Mutex<ProgState>,
@@ -403,6 +426,8 @@ impl Shared {
             cancel: AtomicBool::new(false),
             external,
             total: AtomicI64::new(0),
+            global_rate: AtomicI64::new(0),
+            active: AtomicUsize::new(0),
             etag: Mutex::new(String::new()),
             last_mod: Mutex::new(String::new()),
             prog: Mutex::new(ProgState { last_emit: Instant::now(), last_emit_bytes: 0 }),
@@ -749,20 +774,35 @@ async fn pump(
         }
 
         if watch_slow && window_start.elapsed() >= SLOW_WINDOW {
+            let secs = window_start.elapsed().as_secs_f64();
             let remaining = {
                 let p = part.lock().unwrap();
                 p.to - p.current + 1
             };
-            if remaining > SLOW_REMAINING_MIN && window_bytes < SLOW_MIN_BYTES {
-                shared.logf(
-                    "WARN",
-                    format!(
-                        "连接过慢（5 秒仅下 {} KB，还剩 {} KB），重开连接",
-                        window_bytes / 1024,
-                        remaining / 1024
-                    ),
-                );
-                return Err(Error { kind: ErrorKind::Slow, op: "slow", message: String::new() });
+            if remaining > SLOW_REMAINING_MIN && secs > 0.0 {
+                let conn_rate = window_bytes as f64 / secs;
+                let global = shared.global_rate.load(Ordering::SeqCst) as f64;
+                let active = shared.active.load(Ordering::SeqCst).max(1) as f64;
+                let per_conn = global / active;
+                // 只有"绝对卡死"，或"整体不慢但这只被明显饿着"才重开；
+                // 争抢时大家一样慢 → per_conn 低 → 不折腾。
+                let stuck = conn_rate < STUCK_RATE;
+                let starved = per_conn > FAIR_RATE
+                    && conn_rate < per_conn * 0.4
+                    && conn_rate < SLOW_MIN_BYTES as f64 / secs;
+                if stuck || starved {
+                    shared.logf(
+                        "WARN",
+                        format!(
+                            "连接过慢（{:.0} 秒仅下 {} KB，整体 {:.2} MB/s，还剩 {} KB），重开连接",
+                            secs,
+                            window_bytes / 1024,
+                            global / 1024.0 / 1024.0,
+                            remaining / 1024
+                        ),
+                    );
+                    return Err(Error { kind: ErrorKind::Slow, op: "slow", message: String::new() });
+                }
             }
             window_start = Instant::now();
             window_bytes = 0;
