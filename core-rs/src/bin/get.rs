@@ -106,7 +106,7 @@ fn run_one(logger: &Arc<Logger>, url: &str, dir: &PathBuf) -> i32 {
     let start = Instant::now();
     match engine.download(req, cbs) {
         Ok(res) => {
-            let abs = std::fs::canonicalize(&res.path)
+            let abs = std::path::absolute(&res.path)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| res.path.clone());
             logger.log(
