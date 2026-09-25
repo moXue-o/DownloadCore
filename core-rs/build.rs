@@ -1,14 +1,21 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 编译时把 build 时间戳注入二进制，供程序显示、便于校对版本。
-/// - 若外部设置了环境变量 `BUILD_STAMP`（见 build.ps1），就用它；
-/// - 否则（例如直接 `cargo build`）自动取当前 UTC 时间。
+/// 优先读 `build-stamp.txt`（由 build.ps1 写入）；其次读环境变量 `BUILD_STAMP`；
+/// 都没有就自动取当前 UTC 时间。
 fn main() {
+    // 文件变化即重跑本脚本，保证每次编译都拿到新时间戳
+    println!("cargo:rerun-if-changed=build-stamp.txt");
     println!("cargo:rerun-if-env-changed=BUILD_STAMP");
-    let stamp = std::env::var("BUILD_STAMP").unwrap_or_else(|_| now_stamp());
+
+    let from_file = std::fs::read_to_string("build-stamp.txt")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let stamp = from_file
+        .or_else(|| std::env::var("BUILD_STAMP").ok())
+        .unwrap_or_else(now_stamp);
     println!("cargo:rustc-env=BUILD_STAMP={stamp}");
-    // 让每次编译都重新执行本脚本，从而拿到新的时间戳
-    println!("cargo:rerun-if-changed=build.rs");
 }
 
 fn now_stamp() -> String {
