@@ -17,7 +17,9 @@ cargo build --release
 
 TLS 走**系统实现**（Windows 下为 Schannel），因此不需要 nasm/cmake，也不依赖 OpenSSL。
 
-## 示例程序（演示宿主怎么调用）
+## 测试程序一：Rust 版 `get`（直接用核心）
+
+> 本项目只保留**两个能下载的测试程序**。这是其一（Rust 侧）。其二是 C 版 `demo`（见下节 C ABI）。
 
 ```bash
 cargo run --bin get              # 交互式：提示输入网址
@@ -73,6 +75,8 @@ cargo run --bin get -- -v         # 只看版本
 - **引擎不管平滑/显示**：只给"累计字节 + 瞬时速度"，平滑交给宿主。
 
 ## C ABI（给非 Rust 宿主编译期吸收）
+
+> 对应**测试程序二**：`cdemo\demo.exe` —— 链接静态库 `downloadcore.lib`，验证"库能被 C 程序装进去用"。
 
 产物：`target/release/downloadcore.lib`（staticlib）+ `include/downloadcore.h`。
 
