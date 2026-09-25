@@ -65,9 +65,6 @@ impl Engine {
                 shared.logf("WARN", "无法提升进程优先级，按默认优先级运行");
             }
         }
-        if self.cfg.mode == crate::config::Mode::Extreme {
-            shared.logf("INFO", "极限模式：尽可能多连接抢占共享管道");
-        }
 
         shared.status(Status::Probing);
         let pi = match http.probe(&req.url, &req.headers).await {

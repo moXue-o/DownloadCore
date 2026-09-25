@@ -28,32 +28,11 @@ const BUILD_STAMP: &str = env!("BUILD_STAMP");
 const LOG_FILE: &str = "download.log";
 
 fn main() {
-    // 参数：-v | -t|--threads N | --extreme | <网址>
+    // `-v`：只看版本
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-v" || a == "-V" || a == "--version") {
         println!("简单下载器 v{VERSION} (build {BUILD_STAMP})");
         return;
-    }
-    let mut threads: Option<usize> = None;
-    let mut extreme = false;
-    let mut url_arg: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "-t" || a == "--threads" {
-            if i + 1 < args.len() {
-                threads = args[i + 1].parse().ok();
-                i += 2;
-                continue;
-            }
-        } else if let Some(v) = a.strip_prefix("--threads=") {
-            threads = v.parse().ok();
-        } else if a == "--extreme" {
-            extreme = true;
-        } else if !a.starts_with('-') {
-            url_arg = Some(a.clone());
-        }
-        i += 1;
     }
 
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -68,21 +47,16 @@ fn main() {
     println!();
 
     let logger = Arc::new(Logger::new(&log_path));
-    logger.log(
-        "INFO",
-        &format!(
-            "程序启动 v{VERSION} (build {BUILD_STAMP})，工作目录={}",
-            dir.display()
-        ),
-    );
+    logger.log("INFO", &format!("程序启动 v{VERSION} (build {BUILD_STAMP})，工作目录={}", dir.display()));
 
     // 命令行直接给了网址，就下这一个然后退出
-    if let Some(url) = url_arg {
+    let direct = args.into_iter().find(|a| !a.starts_with('-'));
+    if let Some(url) = direct {
         let rc = if url.eq_ignore_ascii_case("selftest") {
-            run_selftest(&logger, &dir, threads, extreme);
+            run_selftest(&logger, &dir);
             0
         } else {
-            run_one(&logger, &url, &dir, threads, extreme)
+            run_one(&logger, &url, &dir)
         };
         std::process::exit(rc);
     }
@@ -103,24 +77,18 @@ fn main() {
             return;
         }
         if link.eq_ignore_ascii_case("selftest") {
-            run_selftest(&logger, &dir, threads, extreme);
+            run_selftest(&logger, &dir);
         } else {
-            run_one(&logger, &link, &dir, threads, extreme);
+            run_one(&logger, &link, &dir);
         }
         println!();
     }
 }
 
 /// 一次真实下载：这就是"其他程序员调用引擎"的完整样子。
-fn run_one(logger: &Arc<Logger>, url: &str, dir: &PathBuf, threads: Option<usize>, extreme: bool) -> i32 {
+fn run_one(logger: &Arc<Logger>, url: &str, dir: &PathBuf) -> i32 {
     // 1) 配置 + 造引擎
-    let mut cfg = if extreme { Config::extreme() } else { Config::default() };
-    if let Some(n) = threads {
-        if n > 0 {
-            cfg.initial_threads = n;
-            cfg.max_threads = n;
-        }
-    }
+    let mut cfg = Config::default();
     cfg.temp_dir = dir.join(".download-temp");
     let engine = Engine::new(cfg);
 
@@ -206,7 +174,7 @@ fn make_callbacks(logger: &Arc<Logger>) -> Callbacks {
 }
 
 /// 不联网自检：起一个本地测试服务器，完整下一遍并校验。
-fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf, threads: Option<usize>, extreme: bool) {
+fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf) {
     logger.log("INFO", "开始离线自检（不联网）");
     let size = 8 << 20;
     let data: Vec<u8> = (0..size).map(|i| ((i as u64 * 31 + 7) & 0xff) as u8).collect();
@@ -214,13 +182,7 @@ fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf, threads: Option<usize>, ext
     let (addr, _stop) = start_server(data.clone());
     let url = format!("http://{addr}/file.bin");
 
-    let mut cfg = if extreme { Config::extreme() } else { Config::default() };
-    if let Some(n) = threads {
-        if n > 0 {
-            cfg.initial_threads = n;
-            cfg.max_threads = n;
-        }
-    }
+    let mut cfg = Config::default();
     cfg.temp_dir = dir.join(".download-temp");
     let engine = Engine::new(cfg);
     let req = Request {
