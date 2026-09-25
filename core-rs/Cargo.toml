@@ -14,3 +14,10 @@ reqwest = { version = "0.13.5", default-features = false, features = ["native-tl
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "time"] }
+
+# 体积优化：给"被宿主编译期吸收"的 staticlib 减重
+[profile.release]
+opt-level = "z"      # 优化目标偏向体积
+lto = true           # 全局 LTO，消除重复的泛型代码
+codegen-units = 1    # 单编译单元，配合 LTO 体积更小
+strip = true        # 全量去除符号（保留导出接口所需）
