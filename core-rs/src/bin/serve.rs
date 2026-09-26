@@ -14,25 +14,30 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let size_mb: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(64);
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2121);
+    let bps: i64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0); // 每连接限速（字节/秒），0 不限
 
     let size = size_mb * 1024 * 1024;
     let data: Arc<Vec<u8>> = Arc::new((0..size).map(|i| ((i as u64 * 31 + 7) & 0xff) as u8).collect());
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
-    println!("serving http://127.0.0.1:{port}/file.bin   ({size_mb} MB, 支持分段)");
+    if bps > 0 {
+        println!("serving http://127.0.0.1:{port}/file.bin   ({size_mb} MB, 支持分段, 限速 {bps} B/s)");
+    } else {
+        println!("serving http://127.0.0.1:{port}/file.bin   ({size_mb} MB, 支持分段)");
+    }
     println!("按 Ctrl+C 退出。");
 
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             let d = data.clone();
             thread::spawn(move || {
-                let _ = serve(stream, &d);
+                let _ = serve(stream, &d, bps);
             });
         }
     }
 }
 
-fn serve(mut stream: TcpStream, data: &[u8]) -> std::io::Result<()> {
+fn serve(mut stream: TcpStream, data: &[u8], bps: i64) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -58,17 +63,30 @@ fn serve(mut stream: TcpStream, data: &[u8]) -> std::io::Result<()> {
                 end - start + 1
             );
             stream.write_all(head.as_bytes())?;
-            stream.write_all(&data[start as usize..=end as usize])?;
+            write_throttled(&mut stream, &data[start as usize..=end as usize], bps)?;
         }
         _ => {
             let head = format!(
                 "HTTP/1.1 200 OK\r\nAccept-Ranges: none\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(head.as_bytes())?;
-            stream.write_all(data)?;
+            write_throttled(&mut stream, data, bps)?;
         }
     }
     stream.flush()
+}
+
+fn write_throttled(stream: &mut TcpStream, data: &[u8], bps: i64) -> std::io::Result<()> {
+    if bps <= 0 {
+        return stream.write_all(data);
+    }
+    for chunk in data.chunks(8 * 1024) {
+        stream.write_all(chunk)?;
+        stream.flush()?;
+        let secs = chunk.len() as f64 / bps as f64;
+        thread::sleep(std::time::Duration::from_secs_f64(secs));
+    }
+    Ok(())
 }
 
 fn parse_range(h: &str, size: i64) -> Option<(i64, i64)> {
