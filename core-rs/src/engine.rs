@@ -144,7 +144,6 @@ impl Engine {
             self.cfg.max_threads
         };
         let mut last_ctrl = Instant::now();
-        let mut last_rate = 0i64;
 
         loop {
             if shared.is_canceled() {
@@ -167,22 +166,13 @@ impl Engine {
                     rate_t = now;
                     rate_bytes = bytes;
                 }
+                // 自适应（可选）：只增不减地"爬坡"到目标，不做速度反馈 → 不会抖动
                 if self.cfg.adaptive_threads && now.duration_since(last_ctrl) >= Duration::from_secs(2) {
-                    let rate = shared.global_rate.load(Ordering::SeqCst);
-                    if rate as f64 >= last_rate as f64 * 0.98 {
-                        // 速度在涨或基本持平 → 加一个连接（持续探索）
-                        if target < self.cfg.max_threads {
-                            target += 1;
-                            shared.logf("DEBUG", format!("自适应并发：+1 → 目标 {target} 路"));
-                        }
-                    } else if last_rate > 0 && (rate as f64) < (last_rate as f64) * 0.85 {
-                        // 明显变差 → 退回一个连接
-                        if target > self.cfg.initial_threads.max(1) {
-                            target -= 1;
-                            shared.logf("DEBUG", format!("自适应并发：-1 → 目标 {target} 路"));
-                        }
+                    if target < self.cfg.max_threads {
+                        let step = (target / 4).max(1);
+                        target = (target + step).min(self.cfg.max_threads);
+                        shared.logf("DEBUG", format!("自适应并发：爬坡 → 目标 {target} 路"));
                     }
-                    last_rate = rate;
                     last_ctrl = now;
                 }
             }

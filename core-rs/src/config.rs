@@ -53,7 +53,8 @@ impl Default for Config {
             incomplete_suffix: ".part".to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_speed: 0,
-            adaptive_threads: true,
+            // 默认像 AB 一样用固定并发；需要"只增不减爬坡"时再打开
+            adaptive_threads: false,
             use_multiple_ips: true,
         }
     }
