@@ -5,7 +5,7 @@ use downloadcore::{Callbacks, Config, Engine, ErrorKind, Request};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -20,6 +20,7 @@ struct TestServer {
     fail_range: Arc<AtomicBool>,
     stall_after: Arc<AtomicI64>,
     speed: Arc<AtomicI64>,
+    hits: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -35,9 +36,10 @@ impl TestServer {
         let fail_range = Arc::new(AtomicBool::new(false));
         let stall_after = Arc::new(AtomicI64::new(0));
         let speed = Arc::new(AtomicI64::new(0));
+        let hits = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let (d, e, n, f, s, sp, st) = (
+        let (d, e, n, f, s, sp, st, ht) = (
             data.clone(),
             etag.clone(),
             no_range.clone(),
@@ -45,16 +47,17 @@ impl TestServer {
             stall_after.clone(),
             speed.clone(),
             stop.clone(),
+            hits.clone(),
         );
         let handle = thread::spawn(move || {
             while !st.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let _ = stream.set_nonblocking(false);
-                        let (d, e, n, f, s, sp) =
-                            (d.clone(), e.clone(), n.clone(), f.clone(), s.clone(), sp.clone());
+                        let (d, e, n, f, s, sp, ht) =
+                            (d.clone(), e.clone(), n.clone(), f.clone(), s.clone(), sp.clone(), ht.clone());
                         thread::spawn(move || {
-                            let _ = handle_conn(stream, d, e, n, f, s, sp);
+                            let _ = handle_conn(stream, d, e, n, f, s, sp, ht);
                         });
                     }
                     Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -64,7 +67,7 @@ impl TestServer {
                 }
             }
         });
-        TestServer { addr, data, etag, no_range, fail_range, stall_after, speed, stop, handle: Some(handle) }
+        TestServer { addr, data, etag, no_range, fail_range, stall_after, speed, hits, stop, handle: Some(handle) }
     }
 
     fn url(&self) -> String {
@@ -86,6 +89,9 @@ impl TestServer {
     fn set_speed(&self, bps: i64) {
         self.speed.store(bps, Ordering::SeqCst);
     }
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for TestServer {
@@ -105,7 +111,9 @@ fn handle_conn(
     fail_range: Arc<AtomicBool>,
     stall_after: Arc<AtomicI64>,
     speed: Arc<AtomicI64>,
+    hits: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
+    hits.fetch_add(1, Ordering::SeqCst);
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -220,6 +228,7 @@ fn test_config(dir: &PathBuf) -> Config {
     c.idle_timeout = Duration::from_secs(3);
     c.max_retries = 2;
     c.retry_delay = Duration::from_millis(50);
+    c.adaptive_threads = false; // 测试默认固定并发，便于断言
     c
 }
 
@@ -434,4 +443,55 @@ fn pause_and_resume_completes_correctly() {
         )
         .unwrap();
     assert_eq!(read_file(&res.path), data);
+}
+
+#[test]
+fn adaptive_threads_grow() {
+    let data = make_data(6 << 20, 10);
+    let srv = TestServer::new(data.clone());
+    srv.set_speed(1 << 20); // 每连接 1 MB/s，慢一点给自适应时间
+    let dir = unique_dir("adaptive");
+    let target = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.initial_threads = 1;
+    cfg.max_threads = 8;
+    cfg.adaptive_threads = true;
+    let engine = Engine::new(cfg);
+
+    let t0 = std::time::Instant::now();
+    let res = engine
+        .download(
+            Request { url: srv.url(), target_file: Some(target.display().to_string()), ..Default::default() },
+            Callbacks::default(),
+        )
+        .unwrap();
+    let dt = t0.elapsed();
+    assert_eq!(read_file(&res.path), data);
+    assert!(res.parts >= 2, "自适应应当会加人，实际分段 {}，用时 {:?}", res.parts, dt);
+}
+
+#[test]
+fn mirrors_are_used() {
+    let data = make_data(2 << 20, 11);
+    let slow = TestServer::new(data.clone());
+    slow.set_speed(1 << 20); // 主源限速
+    let fast = TestServer::new(data.clone());
+    let dir = unique_dir("mirror");
+    let target = dir.join("out.bin");
+    let cfg = test_config(&dir);
+    let engine = Engine::new(cfg);
+
+    let res = engine
+        .download(
+            Request {
+                url: slow.url(),
+                target_file: Some(target.display().to_string()),
+                mirrors: vec![fast.url()],
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap();
+    assert_eq!(read_file(&res.path), data);
+    assert!(fast.hits() > 0, "镜像应当被用到");
 }

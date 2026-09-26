@@ -32,6 +32,10 @@ pub struct Config {
     pub user_agent: String,
     /// 全局限速（字节/秒），0 表示不限
     pub max_speed: u64,
+    /// 自适应并发：在 initial..max 之间自动找当前网络的最优点（false 则固定用 max_threads）
+    pub adaptive_threads: bool,
+    /// 把域名解析成多个 IP 并行使用（可绕过"单 IP 限速"）
+    pub use_multiple_ips: bool,
 }
 
 impl Default for Config {
@@ -49,6 +53,8 @@ impl Default for Config {
             incomplete_suffix: ".part".to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_speed: 0,
+            adaptive_threads: true,
+            use_multiple_ips: true,
         }
     }
 }

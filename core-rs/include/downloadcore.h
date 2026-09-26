@@ -80,10 +80,12 @@ typedef struct dc_config {
     int      idle_timeout_ms;   /* 空闲超时（毫秒）；<=0 用默认 */
     int      max_retries;       /* 每段最大重试；<0 用默认 */
     int      retry_delay_ms;    /* 重试等待（毫秒）；<=0 用默认 */
-    const char* temp_dir;       /* 临时目录；NULL/空 用默认 */
+    const char* temp_dir;       /* 临时目录；NULL/空 用默认（系统临时目录） */
     const char* incomplete_suffix; /* 未完成后缀；NULL/空 用默认 */
     const char* user_agent;     /* NULL/空 用默认 */
     uint64_t max_speed;         /* 全局限速（字节/秒），0 不限 */
+    int      adaptive_threads;  /* 1=并发在 initial..max 之间自动找最优（默认） */
+    int      use_multiple_ips;  /* 1=域名解析成多个 IP 并行（默认） */
 } dc_config;
 
 typedef struct dc_request {
@@ -93,6 +95,8 @@ typedef struct dc_request {
     const char* const* header_keys;   /* 额外请求头（可 NULL） */
     const char* const* header_values;
     size_t header_count;
+    const char* const* mirror_urls;   /* 镜像地址（同一文件），可 NULL */
+    size_t mirror_count;
 } dc_request;
 
 typedef void (*dc_progress_cb)(void* userdata, const dc_progress* p);

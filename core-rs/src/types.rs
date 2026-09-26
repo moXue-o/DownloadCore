@@ -55,6 +55,8 @@ pub struct Request {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 外部暂停标志：置为 true 即暂停（连接保持，恢复后继续），可从别的线程调用
     pub pause: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 镜像地址（同一文件的其它来源）；可与主地址并行，用来突破单源限速
+    pub mirrors: Vec<String>,
 }
 
 /// 下载成功后的结果。

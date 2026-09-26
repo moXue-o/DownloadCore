@@ -105,6 +105,8 @@ pub struct dc_config {
     pub incomplete_suffix: *const c_char,
     pub user_agent: *const c_char,
     pub max_speed: u64,
+    pub adaptive_threads: c_int,
+    pub use_multiple_ips: c_int,
 }
 
 #[repr(C)]
@@ -116,6 +118,8 @@ pub struct dc_request {
     pub header_keys: *const *const c_char,
     pub header_values: *const *const c_char,
     pub header_count: usize,
+    pub mirror_urls: *const *const c_char,
+    pub mirror_count: usize,
 }
 
 pub type dc_progress_cb = Option<extern "C" fn(userdata: *mut c_void, p: *const dc_progress)>;
@@ -230,6 +234,8 @@ pub extern "C" fn dc_config_default() -> dc_config {
         incomplete_suffix: std::ptr::null(),
         user_agent: std::ptr::null(),
         max_speed: d.max_speed,
+        adaptive_threads: if d.adaptive_threads { 1 } else { 0 },
+        use_multiple_ips: if d.use_multiple_ips { 1 } else { 0 },
     }
 }
 
@@ -274,6 +280,8 @@ pub unsafe extern "C" fn dc_engine_new(cfg: *const dc_config) -> *mut dc_engine 
                 c.user_agent = s;
             }
             c.max_speed = cc.max_speed;
+            c.adaptive_threads = cc.adaptive_threads != 0;
+            c.use_multiple_ips = cc.use_multiple_ips != 0;
         }
         Box::into_raw(Box::new(dc_engine {
             engine: Engine::new(c),
@@ -395,6 +403,16 @@ pub unsafe extern "C" fn dc_engine_download(
                 }
             }
 
+            let mut mirrors = Vec::new();
+            if r.mirror_count > 0 && !r.mirror_urls.is_null() {
+                for i in 0..r.mirror_count {
+                    let m = unsafe { *r.mirror_urls.add(i) };
+                    if let Some(m) = cstr_to_string(m) {
+                        mirrors.push(m);
+                    }
+                }
+            }
+
             let request = Request {
                 url,
                 target_file: cstr_to_string(r.target_file),
@@ -402,6 +420,7 @@ pub unsafe extern "C" fn dc_engine_download(
                 headers,
                 cancel: Some(e.cancel.clone()),
                 pause: Some(e.pause.clone()),
+                mirrors,
             };
 
             let ud = userdata as usize;
@@ -483,16 +502,18 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_result, range_ok), 32);
 
         assert_eq!(align_of::<dc_request>(), 8);
-        assert_eq!(size_of::<dc_request>(), 48);
+        assert_eq!(size_of::<dc_request>(), 64);
         assert_eq!(offset_of!(dc_request, url), 0);
         assert_eq!(offset_of!(dc_request, target_file), 8);
         assert_eq!(offset_of!(dc_request, target_dir), 16);
         assert_eq!(offset_of!(dc_request, header_keys), 24);
         assert_eq!(offset_of!(dc_request, header_values), 32);
         assert_eq!(offset_of!(dc_request, header_count), 40);
+        assert_eq!(offset_of!(dc_request, mirror_urls), 48);
+        assert_eq!(offset_of!(dc_request, mirror_count), 56);
 
         assert_eq!(align_of::<dc_config>(), 8);
-        assert_eq!(size_of::<dc_config>(), 64);
+        assert_eq!(size_of::<dc_config>(), 72);
         assert_eq!(offset_of!(dc_config, initial_threads), 0);
         assert_eq!(offset_of!(dc_config, max_threads), 4);
         assert_eq!(offset_of!(dc_config, min_part_size), 8);
@@ -500,5 +521,7 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_config, incomplete_suffix), 40);
         assert_eq!(offset_of!(dc_config, user_agent), 48);
         assert_eq!(offset_of!(dc_config, max_speed), 56);
+        assert_eq!(offset_of!(dc_config, adaptive_threads), 64);
+        assert_eq!(offset_of!(dc_config, use_multiple_ips), 68);
     }
 }

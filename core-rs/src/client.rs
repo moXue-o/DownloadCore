@@ -1,8 +1,12 @@
 use crate::config::Config;
-use crate::errors::{fatal, retryable, Error, Result, ERR_RANGE_MISMATCH};
+use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
 use reqwest::Client;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
+
+/// 每个域名最多并行使用的 IP 数
+const MAX_IPS_PER_HOST: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct ProbeInfo {
@@ -13,8 +17,17 @@ pub struct ProbeInfo {
     pub file_name: String,
 }
 
+/// 一个下载来源：URL +（可选）绑定到某个 IP 的客户端。
+/// 多个来源轮换使用 → 突破"单 IP / 单源限速"。
+#[derive(Clone)]
+pub struct Source {
+    pub url: String,
+    pub client: Client,
+    pub label: String, // 日志用：IP 或 "default"
+}
+
 pub struct HttpClient {
-    client: Client,
+    sources: Vec<Source>,
     user_agent: String,
 }
 
@@ -26,35 +39,118 @@ fn header_str(resp: &reqwest::Response, name: &str) -> String {
         .to_string()
 }
 
+fn host_of(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(|s| s.to_string())
+}
+
+/// 把域名解析成多个 IP；优先 IPv4，最多取 MAX_IPS_PER_HOST 个。
+fn resolve_ips(host: &str) -> Vec<SocketAddr> {
+    let mut v: Vec<SocketAddr> = (host, 0)
+        .to_socket_addrs()
+        .map(|it| it.collect())
+        .unwrap_or_default();
+    v.sort_by_key(|a| a.is_ipv6()); // IPv4 在前
+    v.dedup();
+    v.truncate(MAX_IPS_PER_HOST);
+    v
+}
+
+fn build_client(cfg: &Config, pin: Option<(&str, SocketAddr)>) -> Result<Client> {
+    let mut b = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(cfg.idle_timeout)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .pool_max_idle_per_host(cfg.max_threads.max(1))
+        .http1_only()
+        // 不使用系统代理：代理属于宿主/系统的设置，应由宿主显式决定
+        .no_proxy();
+    if let Some((host, ip)) = pin {
+        b = b.resolve(host, ip);
+    }
+    b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))
+}
+
+/// 为一个 URL 建来源：多 IP 则每个 IP 一个来源，否则单个未绑定来源。
+fn sources_for(cfg: &Config, url: &str, use_multi_ip: bool) -> Result<Vec<Source>> {
+    let mut out = Vec::new();
+    if use_multi_ip {
+        if let Some(host) = host_of(url) {
+            let ips = resolve_ips(&host);
+            if ips.len() > 1 {
+                for ip in ips {
+                    let client = build_client(cfg, Some((&host, ip)))?;
+                    out.push(Source { url: url.to_string(), client, label: ip.to_string() });
+                }
+                return Ok(out);
+            }
+        }
+    }
+    let client = build_client(cfg, None)?;
+    out.push(Source { url: url.to_string(), client, label: "default".to_string() });
+    Ok(out)
+}
+
+/// 两个来源算不算"同一个文件"：大小一致、ETag 一致（都为空也算）、分段支持一致。
+fn same_file(a: &ProbeInfo, b: &ProbeInfo) -> bool {
+    if a.size != b.size || a.range_ok != b.range_ok {
+        return false;
+    }
+    if !a.etag.is_empty() && !b.etag.is_empty() && a.etag != b.etag {
+        return false;
+    }
+    true
+}
+
 impl HttpClient {
-    pub fn new(cfg: &Config) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(cfg.idle_timeout)
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .pool_max_idle_per_host(cfg.max_threads.max(1))
-            .http1_only()
-            // 不使用系统代理：代理属于宿主/系统的设置，应由宿主显式决定（见 TODO）
-            .no_proxy()
-            .build()
-            .map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
-        Ok(HttpClient { client, user_agent: cfg.user_agent.clone() })
+    /// 建源池并探路。镜像只有"与主源是同一文件"才被采纳。
+    pub async fn build(cfg: &Config, primary: &str, mirrors: &[String]) -> Result<(Self, ProbeInfo)> {
+        let user_agent = cfg.user_agent.clone();
+        let primary_sources = sources_for(cfg, primary, cfg.use_multiple_ips)?;
+        let mut http = HttpClient { sources: primary_sources, user_agent };
+        let info = http.probe(0).await?;
+
+        for m in mirrors {
+            if m.trim().is_empty() {
+                continue;
+            }
+            // 先用未绑定客户端探路，确认是同一文件再纳入
+            let tmp = match sources_for(cfg, m, false) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let pi = http.probe_with(&tmp[0], m).await;
+            match pi {
+                Ok(pi) if same_file(&info, &pi) => match sources_for(cfg, m, cfg.use_multiple_ips) {
+                    Ok(mut srcs) => http.sources.append(&mut srcs),
+                    Err(_) => {}
+                },
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        Ok((http, info))
     }
 
-    fn apply(&self, rb: reqwest::RequestBuilder, headers: &[(String, String)]) -> reqwest::RequestBuilder {
-        let mut rb = rb
-            .header("Accept-Encoding", "identity")
-            .header("User-Agent", self.user_agent.clone());
-        for (k, v) in headers {
-            rb = rb.header(k, v);
-        }
-        rb
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub fn source(&self, idx: usize) -> &Source {
+        &self.sources[idx % self.sources.len().max(1)]
+    }
+
+    async fn probe(&self, idx: usize) -> Result<ProbeInfo> {
+        let s = &self.sources[idx];
+        self.probe_with(s, &s.url).await
     }
 
     /// 先问服务器一句"能分段吗、文件多大"。
-    pub async fn probe(&self, url: &str, headers: &[(String, String)]) -> Result<ProbeInfo> {
+    pub async fn probe_with(&self, s: &Source, url: &str) -> Result<ProbeInfo> {
         let rb = self
-            .apply(self.client.get(url), headers)
+            .apply(s.client.get(url))
             .header("Range", "bytes=0-0");
         let resp = rb
             .send()
@@ -97,18 +193,25 @@ impl HttpClient {
         Ok(info)
     }
 
+    fn apply(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        rb.header("Accept-Encoding", "identity")
+            .header("User-Agent", self.user_agent.clone())
+    }
+
     /// 打开某一段连接并"对暗号"：状态必须 206，且返回起点必须等于 from。
     pub async fn open_range(
         &self,
-        url: &str,
+        s: &Source,
         headers: &[(String, String)],
         from: i64,
         to: i64,
     ) -> Result<reqwest::Response> {
-        let rb = self
-            .apply(self.client.get(url), headers)
-            .header("Range", format!("bytes={from}-{to}"));
+        let mut rb = self.apply(s.client.get(&s.url));
+        for (k, v) in headers {
+            rb = rb.header(k, v);
+        }
         let resp = rb
+            .header("Range", format!("bytes={from}-{to}"))
             .send()
             .await
             .map_err(|e| retryable("request", format!("{e}")))?;
@@ -134,10 +237,13 @@ impl HttpClient {
     /// 普通 GET（不带分段），用于"服务器不支持分段"时的单线程兜底。
     pub async fn open_plain(
         &self,
-        url: &str,
+        s: &Source,
         headers: &[(String, String)],
     ) -> Result<reqwest::Response> {
-        let rb = self.apply(self.client.get(url), headers);
+        let mut rb = self.apply(s.client.get(&s.url));
+        for (k, v) in headers {
+            rb = rb.header(k, v);
+        }
         let resp = rb
             .send()
             .await
@@ -149,7 +255,3 @@ impl HttpClient {
         Ok(resp)
     }
 }
-
-/// 让编译器知道 Error 在本模块被使用（open_range 用 retryable）。
-#[allow(dead_code)]
-fn _assert_error_type(_: &Error) {}

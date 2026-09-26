@@ -25,8 +25,8 @@
 
 /* 布局必须与 Rust 侧一致；对不上就编译报错，避免"静默内存错乱"。 */
 static_assert(sizeof(dc_progress) == 32, "dc_progress layout mismatch");
-static_assert(sizeof(dc_request) == 48, "dc_request layout mismatch");
-static_assert(sizeof(dc_config) == 64, "dc_config layout mismatch");
+static_assert(sizeof(dc_request) == 64, "dc_request layout mismatch");
+static_assert(sizeof(dc_config) == 72, "dc_config layout mismatch");
 static_assert(sizeof(dc_result) == 40, "dc_result layout mismatch");
 
 static FILE* g_log = NULL;

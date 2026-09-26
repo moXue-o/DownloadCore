@@ -1,4 +1,4 @@
-use crate::client::HttpClient;
+use crate::client::{HttpClient, Source};
 use crate::config::Config;
 use crate::errors::{fatal, retryable, Error, ErrorKind, Result, ERR_TOO_MANY_FAILURES};
 use crate::limiter::Limiter;
@@ -56,20 +56,30 @@ impl Engine {
     }
 
     async fn run(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {
-        let http = Arc::new(HttpClient::new(&self.cfg)?);
         let limiter = Arc::new(Limiter::new(self.cfg.max_speed));
         let shared = Arc::new(Shared::new(cbs, req.cancel.clone(), req.pause.clone()));
         *shared.req_url.lock() = req.url.clone();
         let start = Instant::now();
 
         shared.status(Status::Probing);
-        let pi = match http.probe(&req.url, &req.headers).await {
-            Ok(p) => p,
+        // 建来源池（主地址 + 镜像/多 IP）并探路
+        let (http, pi) = match HttpClient::build(&self.cfg, &req.url, &req.mirrors).await {
+            Ok(x) => x,
             Err(e) => {
                 shared.status(Status::Failed);
                 return Err(e);
             }
         };
+        let http = Arc::new(http);
+        let _ = shared.http.set(http);
+        let _ = shared.headers.set(req.headers.clone());
+        shared.logf(
+            "INFO",
+            format!(
+                "下载来源：{} 个（主地址 + 镜像/多 IP）",
+                shared.http.get().map(|h| h.source_count()).unwrap_or(1)
+            ),
+        );
         let size = pi.size.max(0);
         shared.total.store(size, Ordering::SeqCst);
         *shared.etag.lock() = pi.etag.clone();
@@ -91,9 +101,7 @@ impl Engine {
         if !pi.range_ok || size <= 0 {
             shared.logf("INFO", "模式：单线程（服务器不支持分段或大小未知）");
             shared.status(Status::Downloading);
-            if let Err(e) = self
-                .download_whole(&http, &shared, &req, &marker)
-                .await
+            if let Err(e) = self.download_whole(&shared, &marker).await
             {
                 shared.status(Status::Failed);
                 return Err(e);
@@ -129,6 +137,14 @@ impl Engine {
         let mut last_state_save = Instant::now();
         let mut rate_t = Instant::now();
         let mut rate_bytes = 0i64;
+        // 自适应并发：从 initial 起步，每 2 秒按实测速度微调；关闭则固定用 max
+        let mut target = if self.cfg.adaptive_threads {
+            self.cfg.initial_threads.max(1)
+        } else {
+            self.cfg.max_threads
+        };
+        let mut last_ctrl = Instant::now();
+        let mut last_rate = 0i64;
 
         loop {
             if shared.is_canceled() {
@@ -138,7 +154,7 @@ impl Engine {
                 shared.cancel.store(true, Ordering::SeqCst);
                 break;
             }
-            // 维护"整体速度 / 活跃连接数"，供慢连接做相对判断
+            // 维护"整体速度 / 活跃连接数"，供慢连接做相对判断 + 自适应并发
             {
                 let now = Instant::now();
                 let dt = now.duration_since(rate_t).as_secs_f64();
@@ -151,9 +167,27 @@ impl Engine {
                     rate_t = now;
                     rate_bytes = bytes;
                 }
+                if self.cfg.adaptive_threads && now.duration_since(last_ctrl) >= Duration::from_secs(2) {
+                    let rate = shared.global_rate.load(Ordering::SeqCst);
+                    if rate as f64 >= last_rate as f64 * 0.98 {
+                        // 速度在涨或基本持平 → 加一个连接（持续探索）
+                        if target < self.cfg.max_threads {
+                            target += 1;
+                            shared.logf("DEBUG", format!("自适应并发：+1 → 目标 {target} 路"));
+                        }
+                    } else if last_rate > 0 && (rate as f64) < (last_rate as f64) * 0.85 {
+                        // 明显变差 → 退回一个连接
+                        if target > self.cfg.initial_threads.max(1) {
+                            target -= 1;
+                            shared.logf("DEBUG", format!("自适应并发：-1 → 目标 {target} 路"));
+                        }
+                    }
+                    last_rate = rate;
+                    last_ctrl = now;
+                }
             }
-            // 用空闲名额补工人
-            while joinset.len() < self.cfg.max_threads {
+            // 用空闲名额补工人（目标并发由自适应调整）
+            while joinset.len() < target {
                 let next = { shared.queue.lock().pop_front() };
                 let part = match next {
                     Some(p) => p,
@@ -162,16 +196,7 @@ impl Engine {
                         None => break,
                     },
                 };
-                spawn_part(
-                    &mut joinset,
-                    &shared,
-                    &http,
-                    &limiter,
-                    &self.cfg,
-                    &req,
-                    &temp_dir,
-                    part,
-                );
+                spawn_part(&mut joinset, &shared, &limiter, &self.cfg, &temp_dir, part);
             }
             if joinset.is_empty() && shared.queue.lock().is_empty() {
                 break;
@@ -340,9 +365,7 @@ impl Engine {
 
     async fn download_whole(
         &self,
-        http: &Arc<HttpClient>,
         shared: &Arc<Shared>,
-        req: &Request,
         marker: &Path,
     ) -> Result<()> {
         let mut last_err: Option<Error> = None;
@@ -353,7 +376,7 @@ impl Engine {
             if attempt > 0 {
                 tokio::time::sleep(self.cfg.retry_delay).await;
             }
-            match self.download_whole_once(http, shared, req, marker).await {
+            match self.download_whole_once(shared, marker).await {
                 Ok(()) => return Ok(()),
                 Err(e) if e.is_retryable() => last_err = Some(e),
                 Err(e) => return Err(e),
@@ -367,12 +390,12 @@ impl Engine {
 
     async fn download_whole_once(
         &self,
-        http: &Arc<HttpClient>,
         shared: &Arc<Shared>,
-        req: &Request,
         marker: &Path,
     ) -> Result<()> {
-        let mut resp = http.open_plain(&req.url, &req.headers).await?;
+        let (http, source) = shared.pick_source();
+        let headers = shared.headers();
+        let mut resp = http.open_plain(&source, &headers).await?;
         let mut file = File::create(marker).map_err(|e| fatal("create", format!("创建文件失败: {e}")))?;
         shared.downloaded.store(0, Ordering::SeqCst);
         loop {
@@ -416,6 +439,10 @@ struct Shared {
     last_mod: Lock<String>,
     prog: Lock<ProgState>,
     log_mu: Lock<()>,
+    // 来源池（主地址 + 镜像/多 IP）与轮转计数
+    http: std::sync::OnceLock<Arc<HttpClient>>,
+    headers: std::sync::OnceLock<Vec<(String, String)>>,
+    src_next: AtomicUsize,
 }
 
 struct ProgState {
@@ -442,6 +469,9 @@ impl Shared {
             last_mod: Lock::new(String::new()),
             prog: Lock::new(ProgState { last_emit: Instant::now(), last_emit_bytes: 0 }),
             log_mu: Lock::new(()),
+            http: std::sync::OnceLock::new(),
+            headers: std::sync::OnceLock::new(),
+            src_next: AtomicUsize::new(0),
         }
     }
 
@@ -463,6 +493,19 @@ impl Shared {
             .as_ref()
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(false)
+    }
+
+    /// 轮换取一个下载来源（多 IP / 镜像之间轮转）
+    fn pick_source(&self) -> (Arc<HttpClient>, Source) {
+        let http = self.http.get().expect("http 未初始化").clone();
+        let n = http.source_count().max(1);
+        let idx = self.src_next.fetch_add(1, Ordering::SeqCst) % n;
+        let s = http.source(idx).clone();
+        (http, s)
+    }
+
+    fn headers(&self) -> Vec<(String, String)> {
+        self.headers.get().cloned().unwrap_or_default()
     }
 
     fn status(&self, s: Status) {
@@ -585,19 +628,14 @@ fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
 fn spawn_part(
     joinset: &mut tokio::task::JoinSet<()>,
     shared: &Arc<Shared>,
-    http: &Arc<HttpClient>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
-    req: &Request,
     temp_dir: &Path,
     part: Arc<Lock<Part>>,
 ) {
     let s = shared.clone();
-    let h = http.clone();
     let l = limiter.clone();
     let cfg = cfg.clone();
-    let url = req.url.clone();
-    let headers = req.headers.clone();
     let dir = temp_dir.to_path_buf();
     let (from, to) = {
         let p = part.lock();
@@ -605,7 +643,7 @@ fn spawn_part(
     };
     s.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
     joinset.spawn(async move {
-        let res = run_part(&s, &h, &l, &cfg, &url, &headers, &dir, &part).await;
+        let res = run_part(&s, &l, &cfg, &dir, &part).await;
         match res {
             Ok(()) => s.logf("DEBUG", format!("工人结束（完成）：段 [{from}, {to}]")),
             Err(e) if e.kind == ErrorKind::Canceled => {}
@@ -624,11 +662,8 @@ fn spawn_part(
 
 async fn run_part(
     shared: &Arc<Shared>,
-    http: &Arc<HttpClient>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
-    url: &str,
-    headers: &[(String, String)],
     temp_dir: &Path,
     part: &Arc<Lock<Part>>,
 ) -> Result<()> {
@@ -644,7 +679,7 @@ async fn run_part(
             let p = part.lock();
             (p.from, p.to, p.current)
         };
-        match download_part_once(shared, http, limiter, cfg, url, headers, temp_dir, part).await {
+        match download_part_once(shared, limiter, cfg, temp_dir, part).await {
             Ok(()) => {
                 if part.lock().done() {
                     return Ok(());
@@ -669,11 +704,8 @@ async fn run_part(
 
 async fn download_part_once(
     shared: &Arc<Shared>,
-    http: &Arc<HttpClient>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
-    url: &str,
-    headers: &[(String, String)],
     temp_dir: &Path,
     part: &Arc<Lock<Part>>,
 ) -> Result<()> {
@@ -688,10 +720,19 @@ async fn download_part_once(
         if current > to {
             return Ok(());
         }
-        let resp = match http.open_range(url, headers, current, to).await {
+        // 每次（重）连接都轮换一个来源：多 IP / 镜像之间轮转
+        let (http, source) = shared.pick_source();
+        let headers = shared.headers();
+        let resp = match http.open_range(&source, &headers, current, to).await {
             Ok(r) => r,
             Err(e) => {
-                shared.logf("WARN", format!("打开分段连接失败：段 [{from}, {to}]，从 {current} 开始，错误={e}"));
+                shared.logf(
+                    "WARN",
+                    format!(
+                        "打开分段连接失败（来源 {}）：段 [{from}, {to}]，从 {current} 开始，错误={e}",
+                        source.label
+                    ),
+                );
                 return Err(e);
             }
         };
