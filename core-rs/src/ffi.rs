@@ -32,6 +32,56 @@ const DC_LOG_INFO: c_int = 1;
 const DC_LOG_WARN: c_int = 2;
 const DC_LOG_ERROR: c_int = 3;
 
+// 错误码（与 downloadcore.h 的 dc_error 一致）
+const DC_OK: c_int = 0;
+const DC_ERR_BUSY: c_int = 1;
+const DC_ERR_CANCELED: c_int = 2;
+const DC_ERR_RETRY_EXHAUSTED: c_int = 3;
+const DC_ERR_RANGE: c_int = 4;
+const DC_ERR_HTTP: c_int = 5;
+const DC_ERR_IO: c_int = 6;
+const DC_ERR_INVALID: c_int = 7;
+const DC_ERR_INTERNAL: c_int = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct dc_result {
+    pub path: *mut c_char,
+    pub size: i64,
+    pub speed: i64,
+    pub parts: usize,
+    pub range_ok: c_int,
+}
+
+/// 把内部错误映射成对外的错误码。
+fn error_code(e: &crate::errors::Error) -> c_int {
+    use crate::errors::{ErrorKind, ERR_RANGE_MISMATCH, ERR_TOO_MANY_FAILURES};
+    if e.kind == ErrorKind::Canceled {
+        return DC_ERR_CANCELED;
+    }
+    if e.message.starts_with(ERR_TOO_MANY_FAILURES) {
+        return DC_ERR_RETRY_EXHAUSTED;
+    }
+    if e.op == "range" || e.message.contains(ERR_RANGE_MISMATCH) {
+        return DC_ERR_RANGE;
+    }
+    match e.op {
+        "write" | "open" | "create" | "mkdir" | "assemble" | "rename" | "preallocate" | "seek" => {
+            DC_ERR_IO
+        }
+        "request" => DC_ERR_INVALID,
+        _ => {
+            if e.message.contains("builder error") || e.message.contains("invalid URL") {
+                DC_ERR_INVALID
+            } else if e.message.contains("服务器返回状态") {
+                DC_ERR_HTTP
+            } else {
+                DC_ERR_INTERNAL
+            }
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct dc_progress {
@@ -145,6 +195,22 @@ pub extern "C" fn dc_build_stamp() -> *const c_char {
 pub unsafe extern "C" fn dc_string_free(s: *mut c_char) {
     if !s.is_null() {
         unsafe { drop(CString::from_raw(s)) };
+    }
+}
+
+/// 释放 dc_result 里由本库分配的内容（并把字段清零）。
+///
+/// # Safety
+/// `r` 必须是本库填过的 dc_result，且只能释放一次。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_result_free(r: *mut dc_result) {
+    if r.is_null() {
+        return;
+    }
+    let r = unsafe { &mut *r };
+    if !r.path.is_null() {
+        unsafe { drop(CString::from_raw(r.path)) };
+        r.path = std::ptr::null_mut();
     }
 }
 
@@ -271,7 +337,8 @@ pub unsafe extern "C" fn dc_engine_resume(engine: *mut dc_engine) {
 
 /// 同步下载一个文件。
 ///
-/// 返回 0 成功；非 0 失败（此时 `*err_msg` 为错误信息，需 `dc_string_free`）。
+/// 返回 0 成功；非 0 为 dc_error 错误码（此时 `*err_msg` 为错误信息，需 `dc_string_free`）。
+/// 结果写入 `*out`（可为 NULL），其中 path 需 `dc_result_free` 释放。
 ///
 /// # Safety
 /// 指针参数必须有效；回调需在下载期间保持有效。
@@ -283,31 +350,39 @@ pub unsafe extern "C" fn dc_engine_download(
     on_status: dc_status_cb,
     on_log: dc_log_cb,
     userdata: *mut c_void,
-    out_path: *mut *mut c_char,
-    out_size: *mut i64,
-    out_speed: *mut i64,
-    out_parts: *mut usize,
+    out: *mut dc_result,
     err_msg: *mut *mut c_char,
 ) -> c_int {
     if err_msg.is_null() {
-        return 1;
+        return DC_ERR_INVALID;
+    }
+    if !out.is_null() {
+        unsafe {
+            *out = dc_result {
+                path: std::ptr::null_mut(),
+                size: 0,
+                speed: 0,
+                parts: 0,
+                range_ok: 0,
+            };
+        }
     }
 
     let outcome = catch_unwind(AssertUnwindSafe(
-        || -> std::result::Result<crate::types::DownloadResult, String> {
+        || -> std::result::Result<crate::types::DownloadResult, (c_int, String)> {
             if engine.is_null() || req.is_null() {
-                return Err("engine/req 为空".to_string());
+                return Err((DC_ERR_INVALID, "engine/req 为空".to_string()));
             }
             let e = unsafe { &*engine };
             if e.busy.swap(true, Ordering::SeqCst) {
-                return Err("引擎正忙：同一个句柄不支持并发下载".to_string());
+                return Err((DC_ERR_BUSY, "引擎正忙：同一个句柄不支持并发下载".to_string()));
             }
             let _busy = BusyGuard(&e.busy);
             // 每次下载前复位取消/暂停标志
             e.cancel.store(false, Ordering::SeqCst);
             e.pause.store(false, Ordering::SeqCst);
             let r = unsafe { &*req };
-            let url = cstr_to_string(r.url).ok_or_else(|| "URL 为空".to_string())?;
+            let url = cstr_to_string(r.url).ok_or_else(|| (DC_ERR_INVALID, "URL 为空".to_string()))?;
 
             let mut headers = Vec::new();
             if r.header_count > 0 && !r.header_keys.is_null() && !r.header_values.is_null() {
@@ -358,35 +433,31 @@ pub unsafe extern "C" fn dc_engine_download(
 
             e.engine
                 .download(request, cbs)
-                .map_err(|err| err.to_string())
+                .map_err(|err| (error_code(&err), err.to_string()))
         },
     ));
 
     match outcome {
         Ok(Ok(res)) => {
-            unsafe {
-                if !out_path.is_null() {
-                    *out_path = leak_cstring(res.path);
-                }
-                if !out_size.is_null() {
-                    *out_size = res.size;
-                }
-                if !out_speed.is_null() {
-                    *out_speed = res.speed;
-                }
-                if !out_parts.is_null() {
-                    *out_parts = res.parts;
+            if !out.is_null() {
+                unsafe {
+                    let o = &mut *out;
+                    o.path = leak_cstring(res.path);
+                    o.size = res.size;
+                    o.speed = res.speed;
+                    o.parts = res.parts;
+                    o.range_ok = if res.range_ok { 1 } else { 0 };
                 }
             }
-            0
+            DC_OK
         }
-        Ok(Err(msg)) => {
+        Ok(Err((code, msg))) => {
             unsafe { *err_msg = leak_cstring(msg) };
-            1
+            code
         }
         Err(_) => {
             unsafe { *err_msg = leak_cstring("内部 panic 已被捕获".to_string()) };
-            2
+            DC_ERR_INTERNAL
         }
     }
 }
@@ -402,6 +473,14 @@ mod layout_tests {
     fn c_layout_matches_header() {
         assert_eq!(align_of::<dc_progress>(), 8);
         assert_eq!(size_of::<dc_progress>(), 32);
+
+        assert_eq!(align_of::<dc_result>(), 8);
+        assert_eq!(size_of::<dc_result>(), 40);
+        assert_eq!(offset_of!(dc_result, path), 0);
+        assert_eq!(offset_of!(dc_result, size), 8);
+        assert_eq!(offset_of!(dc_result, speed), 16);
+        assert_eq!(offset_of!(dc_result, parts), 24);
+        assert_eq!(offset_of!(dc_result, range_ok), 32);
 
         assert_eq!(align_of::<dc_request>(), 8);
         assert_eq!(size_of::<dc_request>(), 48);

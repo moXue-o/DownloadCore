@@ -27,6 +27,7 @@
 static_assert(sizeof(dc_progress) == 32, "dc_progress layout mismatch");
 static_assert(sizeof(dc_request) == 48, "dc_request layout mismatch");
 static_assert(sizeof(dc_config) == 64, "dc_config layout mismatch");
+static_assert(sizeof(dc_result) == 40, "dc_result layout mismatch");
 
 static FILE* g_log = NULL;
 
@@ -103,34 +104,34 @@ static void on_progress(void* ud, const dc_progress* p) {
 /* 返回 0 成功，非 0 失败 */
 static int do_download(dc_engine* e, const char* url, const char* dir) {
     dc_request req;
-    char*   path  = NULL;
-    int64_t size  = 0;
-    int64_t speed = 0;
-    size_t  parts = 0;
-    char*   err   = NULL;
-    int rc;
+    dc_result  res;
+    char*      err = NULL;
+    int        rc;
 
     memset(&req, 0, sizeof(req));
+    memset(&res, 0, sizeof(res));
     req.url = url;
     req.target_dir = dir;
 
     logline("INFO", "开始下载：");
     logline("INFO", url);
 
-    rc = dc_engine_download(e, &req, on_progress, on_status, on_log, NULL,
-                            &path, &size, &speed, &parts, &err);
+    rc = dc_engine_download(e, &req, on_progress, on_status, on_log, NULL, &res, &err);
     if (rc == 0) {
         char buf[256];
         snprintf(buf, sizeof buf, "下载成功：%s（%lld 字节，平均 %.2f MB/s，分段 %zu）",
-                 path ? path : "(null)", (long long)size, (double)speed / 1048576.0, parts);
+                 res.path ? res.path : "(null)", (long long)res.size,
+                 (double)res.speed / 1048576.0, res.parts);
         logline("INFO", buf);
-        printf(">>> 下载完成：%s\n", path ? path : "(null)");
+        printf(">>> 下载完成：%s\n", res.path ? res.path : "(null)");
     } else {
-        logline("ERROR", err ? err : "(no message)");
-        printf(">>> 下载失败！详细原因见 download.log。\n");
+        char buf[160];
+        snprintf(buf, sizeof buf, "下载失败（错误码 %d）：%s", rc, err ? err : "(no message)");
+        logline("ERROR", buf);
+        printf(">>> 下载失败（错误码 %d）！详细原因见 download.log。\n", rc);
     }
-    if (path) dc_string_free(path);
-    if (err)  dc_string_free(err);
+    dc_result_free(&res);
+    if (err) dc_string_free(err);
     return rc;
 }
 

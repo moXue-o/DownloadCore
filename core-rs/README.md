@@ -88,9 +88,19 @@ dc_engine* e = dc_engine_new(&cfg);
 dc_request req; memset(&req, 0, sizeof(req));
 req.url = "https://...";
 req.target_dir = ".";                      /* 不给文件名就自动取名 */
-dc_engine_download(e, &req, on_progress, on_status, on_log, userdata,
-                   &out_path, &out_size, &out_speed, &out_parts, &err);
-/* 取消（可从别的线程调用）：dc_engine_cancel(e); */
+
+dc_result res; memset(&res, 0, sizeof(res));
+char* err = NULL;
+int rc = dc_engine_download(e, &req, on_progress, on_status, on_log, userdata, &res, &err);
+if (rc == 0) {
+    /* res.path / res.size / res.speed / res.parts / res.range_ok */
+} else {
+    /* rc 是 dc_error；err 是文字说明 */
+    dc_string_free(err);
+}
+dc_result_free(&res);                      /* 释放 res.path */
+
+/* 暂停/恢复/取消（可从别的线程调用）：dc_engine_pause/resume/cancel */
 dc_engine_free(e);
 ```
 

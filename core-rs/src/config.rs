@@ -44,7 +44,8 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(15),
             max_retries: 10,
             retry_delay: Duration::from_secs(1),
-            temp_dir: PathBuf::from(".download-temp"),
+            // 默认放系统临时目录，不在宿主当前目录留东西
+            temp_dir: std::env::temp_dir().join("downloadcore"),
             incomplete_suffix: ".part".to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_speed: 0,
@@ -71,7 +72,7 @@ impl Config {
             self.retry_delay = Duration::from_secs(1);
         }
         if self.temp_dir.as_os_str().is_empty() {
-            self.temp_dir = PathBuf::from(".download-temp");
+            self.temp_dir = std::env::temp_dir().join("downloadcore");
         }
         if self.incomplete_suffix.is_empty() {
             self.incomplete_suffix = ".part".to_string();

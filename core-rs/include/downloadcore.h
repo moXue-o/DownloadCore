@@ -43,6 +43,28 @@ typedef enum dc_log_level {
     DC_LOG_ERROR = 3
 } dc_log_level;
 
+/* 错误码：dc_engine_download 的返回值（0 = 成功） */
+typedef enum dc_error {
+    DC_OK = 0,
+    DC_ERR_BUSY = 1,            /* 同一句柄已有下载在进行 */
+    DC_ERR_CANCELED = 2,        /* 被取消 */
+    DC_ERR_RETRY_EXHAUSTED = 3, /* 重试次数用尽 */
+    DC_ERR_RANGE = 4,           /* 服务器分段与请求不一致 */
+    DC_ERR_HTTP = 5,            /* 服务器返回异常状态 */
+    DC_ERR_IO = 6,              /* 文件/磁盘错误 */
+    DC_ERR_INVALID = 7,         /* 参数无效 */
+    DC_ERR_INTERNAL = 8         /* 其它内部错误 */
+} dc_error;
+
+/* 下载结果（用 dc_result_free 释放其中的 path） */
+typedef struct dc_result {
+    char*   path;      /* 最终文件路径 */
+    int64_t size;      /* 文件大小 */
+    int64_t speed;     /* 平均速度（字节/秒） */
+    size_t  parts;     /* 实际分段数 */
+    int     range_ok;  /* 是否支持分段 */
+} dc_result;
+
 typedef struct dc_progress {
     int64_t downloaded; /* 已下载字节 */
     int64_t total;      /* 总大小；未知为 0 */
@@ -96,8 +118,8 @@ void dc_engine_pause(dc_engine* engine);
 void dc_engine_resume(dc_engine* engine);
 
 /*
- * 同步下载。返回 0 成功；非 0 失败（*err_msg 为错误信息，需 dc_string_free）。
- * out_path 需 dc_string_free；out_size/out_speed/out_parts 可为 NULL。
+ * 同步下载。返回 0 成功；非 0 为 dc_error 错误码（*err_msg 为错误信息，需 dc_string_free）。
+ * 结果写入 *out（可为 NULL），其中 path 需 dc_result_free 释放。
  * 回调函数指针可为 NULL（表示不关心）。
  */
 int dc_engine_download(dc_engine* engine,
@@ -106,14 +128,12 @@ int dc_engine_download(dc_engine* engine,
                        dc_status_cb   on_status,
                        dc_log_cb      on_log,
                        void*          userdata,
-                       char**   out_path,
-                       int64_t* out_size,
-                       int64_t* out_speed,
-                       size_t*  out_parts,
-                       char**   err_msg);
+                       dc_result*     out,
+                       char**         err_msg);
 
-/* 释放由本库返回的字符串 */
+/* 释放由本库返回的字符串 / 结果内容 */
 void dc_string_free(char* s);
+void dc_result_free(dc_result* r);
 
 #ifdef __cplusplus
 }
