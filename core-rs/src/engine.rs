@@ -70,16 +70,14 @@ impl Engine {
                 return Err(e);
             }
         };
+        let n_src = http.source_count().max(1);
         let http = Arc::new(http);
+        let _ = shared.src_labels.set((0..n_src).map(|i| http.source(i).label.clone()).collect());
+        let _ = shared.src_bytes.set((0..n_src).map(|_| AtomicI64::new(0)).collect());
+        let _ = shared.src_conns.set((0..n_src).map(|_| AtomicUsize::new(0)).collect());
         let _ = shared.http.set(http);
         let _ = shared.headers.set(req.headers.clone());
-        shared.logf(
-            "INFO",
-            format!(
-                "下载来源：{} 个（主地址 + 镜像/多 IP）",
-                shared.http.get().map(|h| h.source_count()).unwrap_or(1)
-            ),
-        );
+        shared.logf("INFO", format!("下载来源：{n_src} 个（主地址 + 镜像/多 IP）"));
         let size = pi.size.max(0);
         shared.total.store(size, Ordering::SeqCst);
         *shared.etag.lock() = pi.etag.clone();
@@ -144,6 +142,10 @@ impl Engine {
             self.cfg.max_threads
         };
         let mut last_ctrl = Instant::now();
+        // 诊断统计
+        let mut last_stat = Instant::now();
+        let mut prev_total = 0i64;
+        let mut prev_src: Vec<i64> = Vec::new();
 
         loop {
             if shared.is_canceled() {
@@ -162,7 +164,7 @@ impl Engine {
                     shared
                         .global_rate
                         .store(((bytes - rate_bytes) as f64 / dt) as i64, Ordering::SeqCst);
-                    shared.active.store(joinset.len(), Ordering::SeqCst);
+                    shared.active.store(shared.running.load(Ordering::SeqCst), Ordering::SeqCst);
                     rate_t = now;
                     rate_bytes = bytes;
                 }
@@ -176,8 +178,51 @@ impl Engine {
                     last_ctrl = now;
                 }
             }
+            // 每 2 秒打一条"统计"：活跃数、整体速度、各来源用量（诊断腰斩/波动用）
+            {
+                let now = Instant::now();
+                let dt = now.duration_since(last_stat).as_secs_f64();
+                if dt >= 2.0 {
+                    let total = shared.downloaded.load(Ordering::SeqCst);
+                    let overall = (total - prev_total) as f64 / dt / 1048576.0;
+                    let mut s = format!(
+                        "统计：活跃 {}/{}  整体 {:.2} MB/s  分段 {}",
+                        shared.running.load(Ordering::SeqCst),
+                        target,
+                        overall,
+                        shared.parts.lock().len()
+                    );
+                    if let (Some(b), Some(l)) = (shared.src_bytes.get(), shared.src_labels.get()) {
+                        if prev_src.len() != b.len() {
+                            prev_src = vec![0; b.len()];
+                        }
+                        for (i, c) in b.iter().enumerate() {
+                            let cur = c.load(Ordering::SeqCst);
+                            let r = (cur - prev_src[i]) as f64 / dt / 1048576.0;
+                            let conns = shared
+                                .src_conns
+                                .get()
+                                .and_then(|v| v.get(i))
+                                .map(|x| x.load(Ordering::SeqCst))
+                                .unwrap_or(0);
+                            s.push_str(&format!(
+                                "  |  #{} {} {:.1}MB {:.2}MB/s conns={}",
+                                i,
+                                l.get(i).cloned().unwrap_or_default(),
+                                cur as f64 / 1048576.0,
+                                r,
+                                conns
+                            ));
+                        }
+                        prev_src = b.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+                    }
+                    shared.logf("INFO", s);
+                    last_stat = now;
+                    prev_total = total;
+                }
+            }
             // 用空闲名额补工人（目标并发由自适应调整）
-            while joinset.len() < target {
+            while shared.running.load(Ordering::SeqCst) < target {
                 let next = { shared.queue.lock().pop_front() };
                 let part = match next {
                     Some(p) => p,
@@ -383,7 +428,7 @@ impl Engine {
         shared: &Arc<Shared>,
         marker: &Path,
     ) -> Result<()> {
-        let (http, source) = shared.pick_source();
+        let (http, source, src_idx) = shared.pick_source();
         let headers = shared.headers();
         let mut resp = http.open_plain(&source, &headers).await?;
         let mut file = File::create(marker).map_err(|e| fatal("create", format!("创建文件失败: {e}")))?;
@@ -400,6 +445,7 @@ impl Engine {
                 Ok(Some(b)) => {
                     file.write_all(&b).map_err(|e| fatal("write", format!("{e}")))?;
                     shared.add_downloaded(b.len() as i64);
+                    shared.add_src_bytes(src_idx, b.len() as i64);
                 }
                 Ok(None) => return Ok(()),
                 Err(e) => {
@@ -425,6 +471,8 @@ struct Shared {
     // 整体速度（字节/秒）与活跃连接数，供"相对判断"使用
     global_rate: AtomicI64,
     active: AtomicUsize,
+    // 真正在跑的任务数（用于补齐并发 + 统计）
+    running: AtomicUsize,
     etag: Lock<String>,
     last_mod: Lock<String>,
     prog: Lock<ProgState>,
@@ -433,6 +481,10 @@ struct Shared {
     http: std::sync::OnceLock<Arc<HttpClient>>,
     headers: std::sync::OnceLock<Vec<(String, String)>>,
     src_next: AtomicUsize,
+    // 诊断用：每个来源的标签、累计字节、连接次数
+    src_labels: std::sync::OnceLock<Vec<String>>,
+    src_bytes: std::sync::OnceLock<Vec<AtomicI64>>,
+    src_conns: std::sync::OnceLock<Vec<AtomicUsize>>,
 }
 
 struct ProgState {
@@ -455,6 +507,7 @@ impl Shared {
             total: AtomicI64::new(0),
             global_rate: AtomicI64::new(0),
             active: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
             etag: Lock::new(String::new()),
             last_mod: Lock::new(String::new()),
             prog: Lock::new(ProgState { last_emit: Instant::now(), last_emit_bytes: 0 }),
@@ -462,6 +515,9 @@ impl Shared {
             http: std::sync::OnceLock::new(),
             headers: std::sync::OnceLock::new(),
             src_next: AtomicUsize::new(0),
+            src_labels: std::sync::OnceLock::new(),
+            src_bytes: std::sync::OnceLock::new(),
+            src_conns: std::sync::OnceLock::new(),
         }
     }
 
@@ -485,13 +541,26 @@ impl Shared {
             .unwrap_or(false)
     }
 
-    /// 轮换取一个下载来源（多 IP / 镜像之间轮转）
-    fn pick_source(&self) -> (Arc<HttpClient>, Source) {
+    /// 轮换取一个下载来源（多 IP / 镜像之间轮转），返回其下标供统计
+    fn pick_source(&self) -> (Arc<HttpClient>, Source, usize) {
         let http = self.http.get().expect("http 未初始化").clone();
         let n = http.source_count().max(1);
         let idx = self.src_next.fetch_add(1, Ordering::SeqCst) % n;
         let s = http.source(idx).clone();
-        (http, s)
+        if let Some(v) = self.src_conns.get() {
+            if let Some(c) = v.get(idx) {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        (http, s, idx)
+    }
+
+    fn add_src_bytes(&self, idx: usize, n: i64) {
+        if let Some(v) = self.src_bytes.get() {
+            if let Some(c) = v.get(idx) {
+                c.fetch_add(n, Ordering::SeqCst);
+            }
+        }
     }
 
     fn headers(&self) -> Vec<(String, String)> {
@@ -632,8 +701,10 @@ fn spawn_part(
         (p.from, p.to)
     };
     s.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
+    s.running.fetch_add(1, Ordering::SeqCst);
     joinset.spawn(async move {
         let res = run_part(&s, &l, &cfg, &dir, &part).await;
+        s.running.fetch_sub(1, Ordering::SeqCst);
         match res {
             Ok(()) => s.logf("DEBUG", format!("工人结束（完成）：段 [{from}, {to}]")),
             Err(e) if e.kind == ErrorKind::Canceled => {}
@@ -711,7 +782,7 @@ async fn download_part_once(
             return Ok(());
         }
         // 每次（重）连接都轮换一个来源：多 IP / 镜像之间轮转
-        let (http, source) = shared.pick_source();
+        let (http, source, src_idx) = shared.pick_source();
         let headers = shared.headers();
         let resp = match http.open_range(&source, &headers, current, to).await {
             Ok(r) => r,
@@ -729,7 +800,7 @@ async fn download_part_once(
         file.seek(SeekFrom::Start((current - from) as u64))
             .map_err(|e| fatal("seek", format!("{e}")))?;
         let watch = reconnects < MAX_SLOW_RECONNECTS;
-        match pump(shared, limiter, cfg, part, &mut file, resp, watch).await {
+        match pump(shared, limiter, cfg, part, &mut file, resp, watch, src_idx).await {
             Ok(()) => return Ok(()),
             Err(e) if e.kind == ErrorKind::Slow => {
                 reconnects += 1;
@@ -748,6 +819,7 @@ async fn pump(
     file: &mut File,
     mut resp: reqwest::Response,
     watch_slow: bool,
+    src_idx: usize,
 ) -> Result<()> {
     let mut pending: Vec<u8> = Vec::new();
     let mut pending_off = 0usize;
@@ -819,6 +891,7 @@ async fn pump(
         pending_off += n;
         part.lock().advance(n as i64);
         shared.add_downloaded(n as i64);
+        shared.add_src_bytes(src_idx, n as i64);
         window_bytes += n as i64;
         if limiter
             .wait(n as i64, &|| shared.is_canceled())
