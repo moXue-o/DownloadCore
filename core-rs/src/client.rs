@@ -34,6 +34,8 @@ impl HttpClient {
             .redirect(reqwest::redirect::Policy::limited(10))
             .pool_max_idle_per_host(cfg.max_threads.max(1))
             .http1_only()
+            // 不使用系统代理：代理属于宿主/系统的设置，应由宿主显式决定（见 TODO）
+            .no_proxy()
             .build()
             .map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
         Ok(HttpClient { client, user_agent: cfg.user_agent.clone() })
