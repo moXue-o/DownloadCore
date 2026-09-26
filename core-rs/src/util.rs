@@ -123,6 +123,38 @@ pub fn part_file_name(dir: &Path, from: i64) -> PathBuf {
 
 use std::sync::{Mutex, MutexGuard};
 
+/// 在文件的指定偏移处写入（不改变文件游标），用于"多段并发写同一个文件"。
+/// 循环写满，处理短写。
+#[cfg(windows)]
+pub fn write_all_at(f: &std::fs::File, buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0;
+    while written < buf.len() {
+        let n = f.seek_write(&buf[written..], offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_at 返回 0"));
+        }
+        written += n;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn write_all_at(f: &std::fs::File, buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut written = 0;
+    while written < buf.len() {
+        let n = f.write_at(&buf[written..], offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_at 返回 0"));
+        }
+        written += n;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
 /// 容错加锁：即使别的线程 panic 导致锁"中毒"，也取回内部数据，而不是跟着 panic。
 /// 用它替换裸 `Mutex`，可消除一大类 `unwrap` 崩溃点。
 pub struct Lock<T>(Mutex<T>);

@@ -6,10 +6,10 @@ use crate::part::{Part, SAFETY_STEP};
 use crate::split::split_to_range;
 use crate::store::{self, PartState, ResumeState, STATE_FILE_NAME};
 use crate::types::{Callbacks, DownloadResult, Progress, Request, Status};
-use crate::util::{filename_from_url, job_key, part_file_name, sanitize_name, Lock};
+use crate::util::{filename_from_url, job_key, sanitize_name, Lock};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -127,7 +127,7 @@ impl Engine {
         );
 
         // 分段模式
-        self.prepare_parts(&shared, &pi, &temp_dir)?;
+        self.prepare_parts(&shared, &pi, &temp_dir, &marker)?;
 
         shared.status(Status::Downloading);
 
@@ -231,7 +231,7 @@ impl Engine {
                         None => break,
                     },
                 };
-                spawn_part(&mut joinset, &shared, &limiter, &self.cfg, &temp_dir, part);
+                spawn_part(&mut joinset, &shared, &limiter, &self.cfg, &marker, part);
             }
             if joinset.is_empty() && shared.queue.lock().is_empty() {
                 break;
@@ -260,17 +260,11 @@ impl Engine {
             return Err(Error::canceled());
         }
 
-        // 全部下完 → 拼装
-        let parts_snapshot: Vec<Part> = { shared.parts.lock().iter().map(|p| p.lock().clone()).collect() };
-        let n_segments = parts_snapshot.len();
-        let ranges = crate::assemble::parts_for_assemble(&parts_snapshot);
-        shared.logf(
-            "INFO",
-            format!("所有分段下载完毕，开始拼装 {n_segments} 段 → {}", final_path.display()),
-        );
+        // 全部下完 → 直接把 .part 改名成正式文件（无拼装）
+        let n_segments = { shared.parts.lock().len() };
         shared.status(Status::Assembling);
-        if let Err(e) = crate::assemble::assemble(&temp_dir, &ranges, &marker, &final_path) {
-            shared.logf("ERROR", format!("拼装失败：{e}"));
+        if let Err(e) = move_into_place(&marker, &final_path) {
+            shared.logf("ERROR", format!("改名失败：{e}"));
             shared.status(Status::Failed);
             return Err(e);
         }
@@ -342,6 +336,7 @@ impl Engine {
         shared: &Arc<Shared>,
         pi: &crate::client::ProbeInfo,
         temp_dir: &Path,
+        marker: &Path,
     ) -> Result<()> {
         fs::create_dir_all(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
 
@@ -352,7 +347,7 @@ impl Engine {
                 && st.etag == pi.etag
                 && st.last_modified == pi.last_modified
                 && !st.parts.is_empty()
-                && part_files_usable(temp_dir, &st.parts)
+                && marker.exists()
             {
                 let mut parts = shared.parts.lock();
                 let mut queue = shared.queue.lock();
@@ -376,9 +371,21 @@ impl Engine {
             }
         }
 
-        // 全新开始
+        // 全新开始：清空临时目录，建好输出文件并按总大小预分配
         let _ = fs::remove_dir_all(temp_dir);
         fs::create_dir_all(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
+        if let Some(parent) = marker.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        {
+            let f = File::create(marker).map_err(|e| fatal("create", format!("创建输出文件失败: {e}")))?;
+            if pi.size > 0 {
+                f.set_len(pi.size as u64)
+                    .map_err(|e| fatal("preallocate", format!("预分配失败: {e}")))?;
+            }
+        }
 
         let ranges = if pi.size > self.cfg.min_part_size {
             split_to_range(pi.size, self.cfg.min_part_size, self.cfg.initial_threads)
@@ -640,24 +647,6 @@ fn move_into_place(src: &Path, final_path: &Path) -> Result<()> {
     fs::rename(src, final_path).map_err(|e| fatal("rename", format!("改名失败: {e}")))
 }
 
-/// 校验续传记录里的临时文件是否还在、是否够长。
-fn part_files_usable(temp_dir: &Path, states: &[PartState]) -> bool {
-    for ps in states {
-        let mut need = ps.current - ps.from;
-        if ps.current > ps.to {
-            need = ps.to - ps.from + 1;
-        }
-        if need <= 0 {
-            continue;
-        }
-        match fs::metadata(part_file_name(temp_dir, ps.from)) {
-            Ok(m) if (m.len() as i64) >= need => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
 /// 从所有段里挑"剩下活最多"的那段来分裂。
 fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
     let min_delta = cfg.min_part_size.max(SAFETY_STEP);
@@ -689,13 +678,13 @@ fn spawn_part(
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
-    temp_dir: &Path,
+    out_file: &Path,
     part: Arc<Lock<Part>>,
 ) {
     let s = shared.clone();
     let l = limiter.clone();
     let cfg = cfg.clone();
-    let dir = temp_dir.to_path_buf();
+    let dir = out_file.to_path_buf();
     let (from, to) = {
         let p = part.lock();
         (p.from, p.to)
@@ -725,7 +714,7 @@ async fn run_part(
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
-    temp_dir: &Path,
+    out_file: &Path,
     part: &Arc<Lock<Part>>,
 ) -> Result<()> {
     let mut last_err: Option<Error> = None;
@@ -740,7 +729,7 @@ async fn run_part(
             let p = part.lock();
             (p.from, p.to, p.current)
         };
-        match download_part_once(shared, limiter, cfg, temp_dir, part).await {
+        match download_part_once(shared, limiter, cfg, out_file, part).await {
             Ok(()) => {
                 if part.lock().done() {
                     return Ok(());
@@ -767,11 +756,11 @@ async fn download_part_once(
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
-    temp_dir: &Path,
+    out_file: &Path,
     part: &Arc<Lock<Part>>,
 ) -> Result<()> {
     let from = part.lock().from;
-    let mut file = open_part_file(temp_dir, part)?;
+    let mut file = open_output_file(out_file)?;
     let mut reconnects = 0usize;
     loop {
         let (to, current) = {
@@ -797,8 +786,6 @@ async fn download_part_once(
                 return Err(e);
             }
         };
-        file.seek(SeekFrom::Start((current - from) as u64))
-            .map_err(|e| fatal("seek", format!("{e}")))?;
         let watch = reconnects < MAX_SLOW_RECONNECTS;
         match pump(shared, limiter, cfg, part, &mut file, resp, watch, src_idx).await {
             Ok(()) => return Ok(()),
@@ -886,7 +873,7 @@ async fn pump(
         if n == 0 {
             continue;
         }
-        file.write_all(&pending[pending_off..pending_off + n])
+        crate::util::write_all_at(file, &pending[pending_off..pending_off + n], current as u64)
             .map_err(|e| fatal("write", format!("{e}")))?;
         pending_off += n;
         part.lock().advance(n as i64);
@@ -937,23 +924,10 @@ async fn pump(
     }
 }
 
-fn open_part_file(temp_dir: &Path, part: &Arc<Lock<Part>>) -> Result<File> {
-    let (from, to) = {
-        let p = part.lock();
-        (p.from, p.to)
-    };
-    let path = part_file_name(temp_dir, from);
-    let fresh = !path.exists();
-    let file = OpenOptions::new()
-        .create(true)
+fn open_output_file(marker: &Path) -> Result<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
-        .map_err(|e| fatal("open", format!("打开分段文件失败: {e}")))?;
-    if fresh {
-        let len = (to - from + 1).max(0) as u64;
-        file.set_len(len)
-            .map_err(|e| fatal("preallocate", format!("预分配失败: {e}")))?;
-    }
-    Ok(file)
+        .open(marker)
+        .map_err(|e| fatal("open", format!("打开输出文件失败: {e}")))
 }
