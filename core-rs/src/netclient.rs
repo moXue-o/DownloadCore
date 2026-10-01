@@ -16,12 +16,17 @@
 use crate::backend::{Backend, Endpoint};
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const MAX_REDIRECTS: usize = 10;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单次连接尝试的超时（按地址算）。短一点：一个地址不通就赶紧换下一个。
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
+/// 某个地址连接失败后，进"冷宫"多久（期间不再优先尝试它）。
+const BAD_ADDR_COOLDOWN: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: usize = 500;
 
@@ -45,15 +50,21 @@ impl Target {
     }
 }
 
-/// 自研 HTTP 客户端。无状态（没有连接池），可自由跨线程共享（`&self` 即可）。
+/// 自研 HTTP 客户端。无连接池；可自由跨线程共享（`&self` 即可）。
 pub struct NetClient {
     user_agent: String,
     idle_timeout: Duration,
+    /// "冷宫"：连接失败过的 IP 及其失败时刻，短时间内不再优先尝试。
+    bad: Mutex<HashMap<IpAddr, Instant>>,
 }
 
 impl NetClient {
     pub fn new(user_agent: impl Into<String>, idle_timeout: Duration) -> Self {
-        NetClient { user_agent: user_agent.into(), idle_timeout }
+        NetClient {
+            user_agent: user_agent.into(),
+            idle_timeout,
+            bad: Mutex::new(HashMap::new()),
+        }
     }
 
     /// 探路。注意：会真的发一个 `Range: bytes=0-0` 的 GET。
@@ -158,26 +169,51 @@ impl NetClient {
     }
 
     fn connect(&self, u: &ParsedUrl, pin: Option<IpAddr>) -> Result<Stream> {
-        let addrs: Vec<SocketAddr> = match pin {
-            Some(ip) => vec![SocketAddr::new(ip, u.port)],
-            None => (u.host.as_str(), u.port)
-                .to_socket_addrs()
-                .map_err(|e| fatal("connect", format!("解析主机失败 {}: {e}", u.host)))?
-                .collect(),
-        };
-        if addrs.is_empty() {
+        // 候选地址：优先"绑定的 IP"，然后补上同域名解析出的其它 IP。
+        // 这样某个 IP 偶发连不通时，能在本次请求内直接换一个，而不是干等超时。
+        let mut cands: Vec<IpAddr> = Vec::new();
+        if let Some(ip) = pin {
+            cands.push(ip);
+        }
+        if let Ok(res) = (u.host.as_str(), u.port).to_socket_addrs() {
+            for a in res {
+                let ip = a.ip();
+                if !cands.contains(&ip) {
+                    cands.push(ip);
+                }
+            }
+        }
+        if cands.is_empty() {
             return Err(fatal("connect", format!("找不到主机 {}", u.host)));
         }
 
+        // 把"冷宫"里的地址排到最后；若全在冷宫，则照常逐个尝试（限期已过或都坏）
+        let now = Instant::now();
+        let ordered: Vec<IpAddr> = {
+            let bad = self.bad.lock().unwrap_or_else(|e| e.into_inner());
+            let is_bad = |ip: &IpAddr| {
+                bad.get(ip).map(|t| now.duration_since(*t) < BAD_ADDR_COOLDOWN).unwrap_or(false)
+            };
+            let mut v: Vec<IpAddr> = cands.iter().filter(|ip| !is_bad(ip)).cloned().collect();
+            v.extend(cands.iter().filter(|ip| is_bad(ip)).cloned());
+            v
+        };
+
         let mut tcp = None;
         let mut last = String::new();
-        for a in &addrs {
-            match TcpStream::connect_timeout(a, CONNECT_TIMEOUT) {
+        for ip in &ordered {
+            match TcpStream::connect_timeout(&SocketAddr::new(*ip, u.port), CONNECT_ATTEMPT_TIMEOUT) {
                 Ok(s) => {
+                    // 通了 → 解除冷宫
+                    self.bad.lock().unwrap_or_else(|e| e.into_inner()).remove(ip);
                     tcp = Some(s);
                     break;
                 }
-                Err(e) => last = e.to_string(),
+                Err(e) => {
+                    last = e.to_string();
+                    // 失败 → 进冷宫，短时间内不再优先尝试
+                    self.bad.lock().unwrap_or_else(|e| e.into_inner()).insert(*ip, Instant::now());
+                }
             }
         }
         let tcp = tcp.ok_or_else(|| retryable("connect", format!("连接 {} 失败: {last}", u.host)))?;
