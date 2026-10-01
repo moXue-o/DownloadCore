@@ -9,21 +9,26 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let size_mb: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(64);
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2121);
     let bps: i64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0); // 每连接限速（字节/秒），0 不限
+    // 跳转入口 /redir 的响应延迟（毫秒）：模拟"跳转服务器"的往返开销
+    let delay_ms: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let size = size_mb * 1024 * 1024;
     let data: Arc<Vec<u8>> = Arc::new((0..size).map(|i| ((i as u64 * 31 + 7) & 0xff) as u8).collect());
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
+    println!("serving http://127.0.0.1:{port}/file.bin   ({size_mb} MB, 支持分段)");
     if bps > 0 {
-        println!("serving http://127.0.0.1:{port}/file.bin   ({size_mb} MB, 支持分段, 限速 {bps} B/s)");
-    } else {
-        println!("serving http://127.0.0.1:{port}/file.bin   ({size_mb} MB, 支持分段)");
+        println!("  每连接限速 {bps} B/s");
+    }
+    if delay_ms > 0 {
+        println!("  /redir 跳转延迟 {delay_ms} ms");
     }
     println!("按 Ctrl+C 退出。");
 
@@ -31,16 +36,18 @@ fn main() {
         if let Ok(stream) = stream {
             let d = data.clone();
             thread::spawn(move || {
-                let _ = serve(stream, &d, bps);
+                let _ = serve(stream, &d, bps, port, delay_ms);
             });
         }
     }
 }
 
-fn serve(mut stream: TcpStream, data: &[u8], bps: i64) -> std::io::Result<()> {
+fn serve(mut stream: TcpStream, data: &[u8], bps: i64, port: u16, delay_ms: u64) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let mut start_line = String::new();
+    reader.read_line(&mut start_line)?;
+    let path = start_line.split(' ').nth(1).unwrap_or("/").to_string();
+
     let mut range: Option<(i64, i64)> = None;
     loop {
         let mut h = String::new();
@@ -52,6 +59,18 @@ fn serve(mut stream: TcpStream, data: &[u8], bps: i64) -> std::io::Result<()> {
         if let Some(rest) = lower.strip_prefix("range:") {
             range = parse_range(rest.trim(), data.len() as i64);
         }
+    }
+
+    // 带延迟的跳转入口：模拟"先 302 再到真实地址"的站点
+    if path.starts_with("/redir") {
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        let head = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/file.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes())?;
+        return stream.flush();
     }
 
     let size = data.len() as i64;
