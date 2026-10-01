@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 const MAX_REDIRECTS: usize = 10;
 /// 单次连接尝试的超时（按地址算）。短一点：一个地址不通就赶紧换下一个。
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
+/// 并发起跑（happy eyeballs）时，相邻地址之间的起跑间隔。
+const CONNECT_STAGGER_MS: u64 = 200;
 /// 某个地址连接失败后，进"冷宫"多久（期间不再优先尝试它）。
 const BAD_ADDR_COOLDOWN: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -348,21 +350,37 @@ impl NetClient {
 
         let mut tcp = None;
         let mut last = String::new();
-        for ip in &ordered {
-            match TcpStream::connect_timeout(&SocketAddr::new(*ip, u.port), CONNECT_ATTEMPT_TIMEOUT) {
-                Ok(s) => {
-                    // 通了 → 解除冷宫
-                    self.bad.lock().unwrap_or_else(|e| e.into_inner()).remove(ip);
+        // 起跑式并发连接（happy eyeballs）：逐个地址晚一点起跑，谁先连上就用谁。
+        // 避免"第一个地址不通 → 干等 6 秒再试下一个"。
+        let (tx, rx) = std::sync::mpsc::channel::<(IpAddr, std::io::Result<TcpStream>)>();
+        let port = u.port;
+        for (i, ip) in ordered.iter().enumerate() {
+            let tx = tx.clone();
+            let ip = *ip;
+            let delay = Duration::from_millis(CONNECT_STAGGER_MS * i as u64);
+            std::thread::spawn(move || {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let r = TcpStream::connect_timeout(&SocketAddr::new(ip, port), CONNECT_ATTEMPT_TIMEOUT);
+                let _ = tx.send((ip, r));
+            });
+        }
+        drop(tx);
+        for _ in 0..ordered.len() {
+            match rx.recv() {
+                Ok((ip, Ok(s))) => {
+                    self.bad.lock().unwrap_or_else(|e| e.into_inner()).remove(&ip);
                     self.stat_connects.fetch_add(1, Ordering::Relaxed);
                     tcp = Some(s);
                     break;
                 }
-                Err(e) => {
+                Ok((ip, Err(e))) => {
                     last = e.to_string();
                     self.stat_conn_fail.fetch_add(1, Ordering::Relaxed);
-                    // 失败 → 进冷宫，短时间内不再优先尝试
-                    self.bad.lock().unwrap_or_else(|e| e.into_inner()).insert(*ip, Instant::now());
+                    self.bad.lock().unwrap_or_else(|e| e.into_inner()).insert(ip, Instant::now());
                 }
+                Err(_) => break,
             }
         }
         let tcp = tcp.ok_or_else(|| retryable("connect", format!("连接 {} 失败: {last}", u.host)))?;

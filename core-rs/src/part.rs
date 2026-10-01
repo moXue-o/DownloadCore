@@ -73,8 +73,9 @@ impl Part {
     }
 
     /// 只在"未认领区域 >= min_delta"时才分裂；返回新的后半段。
+    /// 注意：这里不强制 SAFETY_STEP，好让"收尾阶段"把尾巴切得更细（由调用方把握下限）。
     pub fn split_at_least(&mut self, min_delta: i64) -> Option<Part> {
-        let min_delta = min_delta.max(SAFETY_STEP);
+        let min_delta = min_delta.max(1);
         if self.to - self.safe_zone < min_delta {
             return None;
         }

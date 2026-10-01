@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 
 const SLOW_WINDOW: Duration = Duration::from_secs(5);
 const SLOW_MIN_BYTES: i64 = 512 << 10;
-const SLOW_REMAINING_MIN: i64 = 256 << 10;
+// 看门狗管到多小的剩余量：收尾的尾巴也别放任一条慢连接慢慢滴
+const SLOW_REMAINING_MIN: i64 = 64 << 10;
+/// 收尾阶段（活跃工人很少）允许把尾巴切到的最小粒度
+const TAIL_MIN: i64 = 128 << 10;
 const MAX_SLOW_RECONNECTS: usize = 8;
 // 绝对"卡死"线：低于它就重开（与整体快慢无关）
 const STUCK_RATE: f64 = 20.0 * 1024.0;
@@ -657,7 +660,10 @@ fn move_into_place(src: &Path, final_path: &Path) -> Result<()> {
 
 /// 从所有段里挑"剩下活最多"的那段来分裂。
 fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
-    let min_delta = cfg.min_part_size.max(SAFETY_STEP);
+    // 收尾阶段（活跃工人很少）时，允许把尾巴切得更细，
+    // 免得最后几 MB 只剩一条被限速的连接慢慢滴。
+    let running = shared.running.load(Ordering::SeqCst);
+    let min_delta = if running <= 2 { TAIL_MIN } else { cfg.min_part_size.max(SAFETY_STEP) };
     // 先选出目标段（锁的作用域到 block 结束就释放，避免重复加锁死锁）
     let best = {
         let parts = shared.parts.lock();
