@@ -35,6 +35,8 @@ const MAX_HEADERS: usize = 500;
 const POOL_MAX_IDLE: usize = 32;
 /// 空闲连接最长留多久
 const POOL_IDLE_MAX: Duration = Duration::from_secs(30);
+/// "跳转后的真实地址"记多久（之后重新解析，避免签名过期）
+const FINAL_URL_TTL: Duration = Duration::from_secs(300);
 
 /// 探路结果：两个后端共用同一形状（定义在 `backend`）。
 pub use crate::backend::ProbeInfo;
@@ -72,6 +74,8 @@ pub struct NetClient {
     bad: Mutex<HashMap<IpAddr, Instant>>,
     /// keep-alive 连接池：按 "host:port|ip" 复用连接。
     pool: Pool,
+    /// 跳转缓存：原始地址 -> 跳转后的真实地址（省掉每分段的一跳）。
+    final_cache: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl NetClient {
@@ -81,6 +85,7 @@ impl NetClient {
             idle_timeout,
             bad: Mutex::new(HashMap::new()),
             pool: Arc::new(Mutex::new(HashMap::new())),
+            final_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -150,7 +155,8 @@ impl NetClient {
         Ok(body)
     }
 
-    /// 发一次请求（含跟随跳转），返回最终响应的状态码、响应头和响应体读取器。
+    /// 发一次请求，返回状态码 / 响应头 / 响应体读取器。
+    /// 优先走"上次跳转后的真实地址"（省掉每一跳的分段请求）；失效则回退原始地址。
     fn request(
         &self,
         url: &str,
@@ -158,6 +164,42 @@ impl NetClient {
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<(u16, Vec<(String, String)>, Body)> {
+        if let Some(final_url) = self.cached_final(url) {
+            if final_url != url {
+                if let Ok((status, hdrs, body, _)) =
+                    self.request_follow(&final_url, None, headers, range)
+                {
+                    if (200..400).contains(&status) {
+                        return Ok((status, hdrs, body));
+                    }
+                }
+                // 缓存失效（签名过期等）：清掉，回退原始地址重新跳转
+                self.final_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(url);
+            }
+        }
+        let (status, hdrs, body, final_url) = self.request_follow(url, pin, headers, range)?;
+        if final_url != url {
+            let mut m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
+            m.insert(url.to_string(), (final_url, Instant::now()));
+        }
+        Ok((status, hdrs, body))
+    }
+
+    /// 取一条仍然新鲜的"真实地址"缓存。
+    fn cached_final(&self, url: &str) -> Option<String> {
+        let m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(url)
+            .and_then(|(u, t)| if t.elapsed() < FINAL_URL_TTL { Some(u.clone()) } else { None })
+    }
+
+    /// 跟随跳转发送请求；返回最终地址。
+    fn request_follow(
+        &self,
+        url: &str,
+        pin: Option<IpAddr>,
+        headers: &[(String, String)],
+        range: Option<(i64, i64)>,
+    ) -> Result<(u16, Vec<(String, String)>, Body, String)> {
         let mut current = url.to_string();
         for _ in 0..=MAX_REDIRECTS {
             let u = parse_url(&current)?;
@@ -194,7 +236,7 @@ impl NetClient {
 
             let keep = wants_keep_alive(&hdrs);
             let body = Body::new(reader, &hdrs, keep, Some((self.pool.clone(), key)));
-            return Ok((status, hdrs, body));
+            return Ok((status, hdrs, body, current));
         }
         Err(retryable("redirect", "跳转次数过多"))
     }

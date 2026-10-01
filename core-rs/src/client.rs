@@ -3,11 +3,10 @@
 //! 定位与自研后端完全一致（同一套引擎、同一个 C 接口、同样功能），
 //! 区别只在"上网这一层"用了成熟框架——稳、边角全，但体积大。
 //!
-//! 引擎是"一个工人一条线程"的阻塞模型，这里用两种手段把它接好、且不拖后腿：
-//!   1. **按来源缓存并复用 `reqwest::Client`** → 连接池/keep-alive 生效，
-//!      同一条长连接上的分段、重试、重连都能复用 TCP+TLS，不再每次从头握手；
-//!   2. **响应体走 channel 流式转交**：由运行时的工作线程驱动 `chunk().await`，
-//!      阻塞读这边只是收数据——避免"每读一块就 block_on 一次"的调度开销。
+//! 与自研后端平起平坐的几个做法：
+//!   · 按来源**缓存并复用 `reqwest::Client`** → 连接池/keep-alive 生效；
+//!   · 响应体走 channel **流式**转给阻塞读（去掉"每块 block_on"）；
+//!   · **记住跳转后的真实地址**，后面分段直接打过去（省掉每一跳）。
 
 use crate::backend::{host_of, port_of, Backend, Endpoint, ProbeInfo};
 use crate::config::Config;
@@ -15,15 +14,17 @@ use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// 连接超时：与自研后端一致（短超时，避免个别地址连不通时干等）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 /// 连接池里每条来源最多留多少条空闲长连接。
 const POOL_IDLE_SECS: u64 = 90;
+/// "跳转后的真实地址"记多久（之后重新解析，避免签名过期）。
+const FINAL_URL_TTL: Duration = Duration::from_secs(300);
 
 pub struct LtsBackend {
     rt: Arc<tokio::runtime::Runtime>,
@@ -32,6 +33,8 @@ pub struct LtsBackend {
     max_threads: usize,
     /// 按 "host|ip" 缓存客户端：连同一个来源的请求复用同一个连接池。
     clients: Mutex<HashMap<String, reqwest::Client>>,
+    /// 跳转缓存：原始地址 -> 跳转后的真实地址（省掉每分段的一跳）。
+    final_cache: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl LtsBackend {
@@ -47,12 +50,13 @@ impl LtsBackend {
             idle_timeout: cfg.idle_timeout,
             max_threads: cfg.max_threads.max(1),
             clients: Mutex::new(HashMap::new()),
+            final_cache: Mutex::new(HashMap::new()),
         })
     }
 
-    fn client_for(&self, ep: &Endpoint) -> Result<reqwest::Client> {
-        let host = host_of(&ep.url).unwrap_or_default();
-        let key = format!("{host}|{}", ep.ip.map(|i| i.to_string()).unwrap_or_default());
+    fn client_for(&self, url: &str, ip: Option<IpAddr>) -> Result<reqwest::Client> {
+        let host = host_of(url).unwrap_or_default();
+        let key = format!("{host}|{}", ip.map(|i| i.to_string()).unwrap_or_default());
         if let Some(c) = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(c.clone());
         }
@@ -66,15 +70,65 @@ impl LtsBackend {
             .http1_only()
             // 不使用系统代理：代理属于宿主/系统的设置，应由宿主显式决定
             .no_proxy();
-        if let Some(ip) = ep.ip {
+        if let Some(ip) = ip {
             if !host.is_empty() {
-                b = b.resolve(&host, SocketAddr::new(ip, port_of(&ep.url)));
+                b = b.resolve(&host, SocketAddr::new(ip, port_of(url)));
             }
         }
         let client =
             b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
         self.clients.lock().unwrap_or_else(|e| e.into_inner()).insert(key, client.clone());
         Ok(client)
+    }
+
+    fn cached_final(&self, url: &str) -> Option<String> {
+        let m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(url)
+            .and_then(|(u, t)| if t.elapsed() < FINAL_URL_TTL { Some(u.clone()) } else { None })
+    }
+
+    fn clear_final(&self, url: &str) {
+        self.final_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(url);
+    }
+
+    /// 发一次 GET（带可选 Range）。优先走上次跳转后的真实地址。
+    fn get(
+        &self,
+        ep: &Endpoint,
+        headers: &[(String, String)],
+        range: Option<(i64, i64)>,
+    ) -> Result<reqwest::Response> {
+        let (url, ip) = match self.cached_final(&ep.url) {
+            Some(f) if f != ep.url => (f, None), // 用真实地址，不再 pin 原始主机
+            _ => (ep.url.clone(), ep.ip),
+        };
+        let client = self.client_for(&url, ip)?;
+        let ua = self.user_agent.clone();
+        let headers = headers.to_vec();
+        let resp = self
+            .rt
+            .block_on(async move {
+                let mut rb = client
+                    .get(&url)
+                    .header("Accept-Encoding", "identity")
+                    .header("User-Agent", ua);
+                if let Some((a, b)) = range {
+                    rb = rb.header("Range", format!("bytes={a}-{b}"));
+                }
+                for (k, v) in &headers {
+                    rb = rb.header(k, v);
+                }
+                rb.send().await
+            })
+            .map_err(|e| retryable("request", format!("{e}")))?;
+
+        // 记下"跳转后的真实地址"，供后续分段直接使用
+        let final_url = resp.url().as_str();
+        if final_url != ep.url {
+            let mut m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
+            m.insert(ep.url.clone(), (final_url.to_string(), Instant::now()));
+        }
+        Ok(resp)
     }
 
     /// 把响应体交给运行时异步读取，再经 channel 流式转给阻塞读（有背压）。
@@ -116,21 +170,7 @@ impl Backend for LtsBackend {
     }
 
     fn probe(&self, ep: &Endpoint) -> Result<ProbeInfo> {
-        let client = self.client_for(ep)?;
-        let url = ep.url.clone();
-        let ua = self.user_agent.clone();
-        let resp = self
-            .rt
-            .block_on(async move {
-                client
-                    .get(&url)
-                    .header("Accept-Encoding", "identity")
-                    .header("User-Agent", ua)
-                    .header("Range", "bytes=0-0")
-                    .send()
-                    .await
-            })
-            .map_err(|e| retryable("probe", format!("{e}")))?;
+        let resp = self.get(ep, &[], Some((0, 0)))?;
 
         let status = resp.status().as_u16();
         let etag = header_str(&resp, "etag");
@@ -155,6 +195,7 @@ impl Backend for LtsBackend {
             info.range_ok = false;
             info.size = clen;
         } else {
+            self.clear_final(&ep.url); // 缓存可能失效，下次重新解析
             return Err(fatal("probe", format!("服务器返回状态 {status}")));
         }
         if accept_ranges.eq_ignore_ascii_case("none") {
@@ -170,27 +211,11 @@ impl Backend for LtsBackend {
         from: i64,
         to: i64,
     ) -> Result<Box<dyn Read + Send>> {
-        let client = self.client_for(ep)?;
-        let url = ep.url.clone();
-        let ua = self.user_agent.clone();
-        let headers = headers.to_vec();
-        let resp = self
-            .rt
-            .block_on(async move {
-                let mut rb = client
-                    .get(&url)
-                    .header("Accept-Encoding", "identity")
-                    .header("User-Agent", ua)
-                    .header("Range", format!("bytes={from}-{to}"));
-                for (k, v) in &headers {
-                    rb = rb.header(k, v);
-                }
-                rb.send().await
-            })
-            .map_err(|e| retryable("request", format!("{e}")))?;
+        let resp = self.get(ep, headers, Some((from, to)))?;
 
         let status = resp.status().as_u16();
         if status != 206 {
+            self.clear_final(&ep.url);
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_str(&resp, "content-range");
@@ -206,26 +231,10 @@ impl Backend for LtsBackend {
     }
 
     fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>> {
-        let client = self.client_for(ep)?;
-        let url = ep.url.clone();
-        let ua = self.user_agent.clone();
-        let headers = headers.to_vec();
-        let resp = self
-            .rt
-            .block_on(async move {
-                let mut rb = client
-                    .get(&url)
-                    .header("Accept-Encoding", "identity")
-                    .header("User-Agent", ua);
-                for (k, v) in &headers {
-                    rb = rb.header(k, v);
-                }
-                rb.send().await
-            })
-            .map_err(|e| retryable("request", format!("{e}")))?;
-
+        let resp = self.get(ep, headers, None)?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
+            self.clear_final(&ep.url);
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
         Ok(Box::new(self.body(resp)))
