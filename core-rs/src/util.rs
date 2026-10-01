@@ -70,13 +70,18 @@ fn percent_decode(s: &str) -> String {
 
 /// 从网址路径里猜文件名。
 pub fn filename_from_url(raw: &str) -> String {
-    let u = match reqwest::Url::parse(raw) {
-        Ok(u) => u,
-        Err(_) => return String::new(),
+    // 只取 path 部分（去协议/主机/查询/锚点），再取最后一段
+    let rest = match raw.split_once("://") {
+        Some((_, r)) => r,
+        None => raw,
     };
-    let seg = u.path_segments();
-    let name = seg.and_then(|s| s.last()).unwrap_or("");
-    if name.is_empty() || name == "." || name == "/" {
+    let after_host = match rest.find('/') {
+        Some(i) => &rest[i..],
+        None => return String::new(),
+    };
+    let path = after_host.split(['?', '#']).next().unwrap_or(after_host);
+    let name = path.rsplit('/').next().unwrap_or("");
+    if name.is_empty() || name == "." {
         return String::new();
     }
     percent_decode(name)

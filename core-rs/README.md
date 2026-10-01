@@ -4,16 +4,27 @@ Go 验证版的 Rust 重写。目标形态：**`staticlib` + C ABI**，能被宿
 
 定位不变：只做"把 URL 后面的字节原样搬成本地文件"，不含界面、队列等外壳。
 
-## 构建 / 测试
+## 两个版本：写一次代码，编译期选"网络后端"
 
-需要：Rust（rustup 稳定版）+ Windows 上还需 MSVC 链接器（Visual Studio Build Tools）。
+同一套引擎（分段 / 动态分段 / 续传 / 看门狗 / 单文件直写 / C 接口），只换**上网那一层**：
+
+| | 正式版（默认） | LTS 版 |
+| --- | --- | --- |
+| 网络后端 | 自研 `netclient`：标准库 + 系统 TLS | 现成 `reqwest`（大依赖） |
+| 定位 | 小、依赖少，主推 | 稳、边角全，长期兜底 |
+| 宿主 exe | ~0.59 MB | ~1.69 MB |
 
 ```bash
 cd core-rs
-cargo test          # 跑全部测试
-cargo build         # 产出 target/debug/downloadcore.lib（staticlib）
-cargo build --release
+cargo test                                          # 默认跑"自研后端"
+cargo test --features backend-lts                    # 跑"LTS 后端"（同一套测试）
+cargo build --release --lib                          # 正式版：target/release/downloadcore.lib
+cargo build --release --lib --features backend-lts   # LTS 版
 ```
+
+两版**功能、接口、行为完全一致**：宿主换个链接的库即可，代码一行不用改。
+
+需要：Rust（rustup 稳定版）；Windows 上还需 MSVC 链接器（Visual Studio Build Tools）。
 
 TLS 走**系统实现**（Windows 下为 Schannel），因此不需要 nasm/cmake，也不依赖 OpenSSL。
 
@@ -43,25 +54,28 @@ cargo run --bin get -- -v         # 只看版本
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/engine.rs` | 引擎与调度（异步内部、阻塞外壳） |
+| `src/engine.rs` | 引擎与调度（一个工人一条线程，阻塞式） |
+| `src/backend.rs` | 网络后端抽象（`probe` / `open_range` / `open_plain`）+ 来源池（镜像 / 多 IP） |
+| `src/netclient.rs` | 自研网络层（正式版后端）：标准库 + 系统 TLS，含分块 / 跳转 / 读超时 |
+| `src/client.rs` | LTS 后端：用 reqwest 实现同一接口（`--features backend-lts`） |
 | `src/part.rs` | 分段 + 安全区（"边下边分"的核心） |
 | `src/split.rs` | 开局均匀切分 |
-| `src/client.rs` | 探路、分段请求、"对暗号"（基于 reqwest） |
 | `src/store.rs` | 续传记录（原子写入） |
-| `src/assemble.rs` | 分段临时文件拼装 |
 | `src/limiter.rs` | 全局令牌桶限速 |
 | `src/errors.rs` | 错误分类：可重试 / 致命 / 取消 / 过慢 |
-| `src/util.rs` | 文件名解析、路径、哈希等 |
-| `tests/engine_test.rs` | 端到端测试（含一个 std 实现的测试服务器） |
+| `src/util.rs` | 文件名解析、路径、哈希、定位写入等 |
+| `tests/common/mod.rs` | 可摆布的测试服务器（分段/不分段/分块/跳转/卡住/限速） |
+| `tests/engine_test.rs` | 引擎端到端测试 |
+| `tests/netclient_test.rs` | 自研网络层独立测试 |
 
 ## 已实现（对应 Go 验证版）
 
 - 多线程分段下载；动态分段（挑"剩余最多"的段分裂）
 - 对暗号（校验服务器返回分段起点）
 - 认得出"文件变了"（大小 / ETag / 最后修改）
-- 空闲超时（`reqwest` 的 `read_timeout`）
+- 空闲超时（套接字读超时精确控制，一次 read 超时即可判定"卡住"）
 - 慢连接看门狗（过慢则重开连接）
-- 错误分类、分段临时文件 + 拼装、下完才改名
+- 错误分类、单输出文件按偏移直写（无拼装）、下完才改名
 - 续传（原子写入 + 取消后续传 + 换文件重下）
 - 全局限速、探测分段支持、文件名解析
 - **镜像 / 多来源**：同一文件多个地址并行，突破单源限速（大小/ETag 一致才采纳镜像）
@@ -69,12 +83,13 @@ cargo run --bin get -- -v         # 只看版本
 - **自适应并发**（可选，默认关）：只增不减地"爬坡"到 max（不做速度反馈，不会抖动）；关则固定用 max。像 AB 那样固定并发也完全可用
 - 暂停 / 恢复 / 取消（可从别的线程调用）
 
-测试：4 个单元测试 + 6 个集成测试，全部通过。
+测试：5 个单元测试 + 9 个引擎端到端测试 + 10 个自研网络层测试，全部通过；两种后端各跑一遍。
 
 ## 设计要点
 
-- **对外阻塞、对内异步**：`Engine::download` 是同步接口，内部用 tokio 运行时 + 异步 reqwest，
-  这样既能用上"逐次读超时"，宿主又能用最简单的同步调用。
+- **一个工人一条线程**：阻塞式，"每段一条连接"的语义最自然；对外仍是同步接口。
+- **只换上网那一层**：引擎只认 `Backend` 接口（`probe` / `open_range` / `open_plain`），
+  自研后端与 LTS 后端都实现它，因此"写一次代码、打包两个版本"。
 - **只用 HTTP/1.1**：多连接比多路复用更适合按连接限速的 CDN。
 - **引擎不管平滑/显示**：只给"累计字节 + 瞬时速度"，平滑交给宿主。
 
@@ -115,17 +130,16 @@ dc_engine_free(e);
 
 ```bash
 cd core-rs
-cargo build --release
+cargo build --release --lib
 cd cdemo && .\build.bat          # 用 MSVC 编译并链接 downloadcore.lib
 # 另开一个窗口起本地服务器：
 #   ..\target\release\serve.exe 64 2121
 .\demo.exe http://127.0.0.1:2121/file.bin .
 ```
 
-实测：`demo.exe`（2.4 MB，内含静态链入的核心）成功下载 64 MB 并逐字节正确。
+实测：正式版 `demo.exe` 约 **0.59 MB**（内含静态链入的核心），成功下载 64 MB 并逐字节正确。
 
 ## 下一步
 
-- 与 Go 版对齐的参数与行为收口。
-- 小本本"后续更新"里的能力（代理 / 凭据 / 校验和 / 镜像 / 自适应并发）。
+- 把两种后端的"来源池 / 参数"进一步收口为一份配置。
 - 跨平台（Linux/macOS）验证。

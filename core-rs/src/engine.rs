@@ -1,4 +1,4 @@
-use crate::client::{HttpClient, Source};
+use crate::backend::{build_pool, Backend, Endpoint, ProbeInfo};
 use crate::config::Config;
 use crate::errors::{fatal, retryable, Error, ErrorKind, Result, ERR_TOO_MANY_FAILURES};
 use crate::limiter::Limiter;
@@ -9,10 +9,11 @@ use crate::types::{Callbacks, DownloadResult, Progress, Request, Status};
 use crate::util::{filename_from_url, job_key, sanitize_name, Lock};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const SLOW_WINDOW: Duration = Duration::from_secs(5);
@@ -25,21 +26,30 @@ const STUCK_RATE: f64 = 20.0 * 1024.0;
 const FAIR_RATE: f64 = 150.0 * 1024.0;
 
 /// 下载核心。只负责把一个 URL 下成一个文件。
+///
+/// 并发模型：**一个工人一条线程**（阻塞式），天然吻合"每段一条连接"的下载语义，
+/// 也让"自研后端"和"大框架后端"能套同一个引擎。
 pub struct Engine {
     cfg: Config,
-    rt: tokio::runtime::Runtime,
+    backend: Arc<dyn Backend>,
+}
+
+/// 编译期选择网络后端：默认自研（正式版），`--features backend-lts` 换大框架（LTS 版）。
+#[cfg(feature = "backend-lts")]
+fn make_backend(cfg: &Config) -> Arc<dyn Backend> {
+    Arc::new(crate::client::LtsBackend::new(cfg).expect("创建 LTS 后端失败"))
+}
+
+#[cfg(not(feature = "backend-lts"))]
+fn make_backend(cfg: &Config) -> Arc<dyn Backend> {
+    Arc::new(crate::netclient::NetClient::new(cfg.user_agent.clone(), cfg.idle_timeout))
 }
 
 impl Engine {
     pub fn new(cfg: Config) -> Self {
         let cfg = cfg.normalized();
-        // 运行时只建一次，反复下载复用（避免每次重建线程池的开销）
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cfg.max_threads.clamp(4, 64))
-            .enable_all()
-            .build()
-            .expect("无法创建 tokio 运行时");
-        Engine { cfg, rt }
+        let backend = make_backend(&cfg);
+        Engine { cfg, backend }
     }
 
     pub fn config(&self) -> &Config {
@@ -52,10 +62,10 @@ impl Engine {
         if req.url.is_empty() {
             return Err(fatal("request", "URL 为空"));
         }
-        self.rt.block_on(self.run(req, cbs))
+        self.run(req, cbs)
     }
 
-    async fn run(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {
+    fn run(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {
         let limiter = Arc::new(Limiter::new(self.cfg.max_speed));
         let shared = Arc::new(Shared::new(cbs, req.cancel.clone(), req.pause.clone()));
         *shared.req_url.lock() = req.url.clone();
@@ -63,21 +73,25 @@ impl Engine {
 
         shared.status(Status::Probing);
         // 建来源池（主地址 + 镜像/多 IP）并探路
-        let (http, pi) = match HttpClient::build(&self.cfg, &req.url, &req.mirrors).await {
+        let (eps, pi) = match build_pool(self.backend.as_ref(), &self.cfg, &req.url, &req.mirrors) {
             Ok(x) => x,
             Err(e) => {
                 shared.status(Status::Failed);
                 return Err(e);
             }
         };
-        let n_src = http.source_count().max(1);
-        let http = Arc::new(http);
-        let _ = shared.src_labels.set((0..n_src).map(|i| http.source(i).label.clone()).collect());
+        let n_src = eps.len().max(1);
+        let labels: Vec<String> = eps.iter().map(|e| e.label.clone()).collect();
+        let _ = shared.src_labels.set(labels);
         let _ = shared.src_bytes.set((0..n_src).map(|_| AtomicI64::new(0)).collect());
         let _ = shared.src_conns.set((0..n_src).map(|_| AtomicUsize::new(0)).collect());
-        let _ = shared.http.set(http);
+        let _ = shared.endpoints.set(eps);
+        let _ = shared.backend.set(self.backend.clone());
         let _ = shared.headers.set(req.headers.clone());
-        shared.logf("INFO", format!("下载来源：{n_src} 个（主地址 + 镜像/多 IP）"));
+        shared.logf(
+            "INFO",
+            format!("下载来源：{n_src} 个（主地址 + 镜像/多 IP；网络后端={}）", self.backend.name()),
+        );
         let size = pi.size.max(0);
         shared.total.store(size, Ordering::SeqCst);
         *shared.etag.lock() = pi.etag.clone();
@@ -99,8 +113,7 @@ impl Engine {
         if !pi.range_ok || size <= 0 {
             shared.logf("INFO", "模式：单线程（服务器不支持分段或大小未知）");
             shared.status(Status::Downloading);
-            if let Err(e) = self.download_whole(&shared, &marker).await
-            {
+            if let Err(e) = self.download_whole(&shared, &marker) {
                 shared.status(Status::Failed);
                 return Err(e);
             }
@@ -131,7 +144,7 @@ impl Engine {
 
         shared.status(Status::Downloading);
 
-        let mut joinset = tokio::task::JoinSet::new();
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
         let mut last_state_save = Instant::now();
         let mut rate_t = Instant::now();
         let mut rate_bytes = 0i64;
@@ -231,20 +244,23 @@ impl Engine {
                         None => break,
                     },
                 };
-                spawn_part(&mut joinset, &shared, &limiter, &self.cfg, &marker, part);
+                spawn_part(&mut handles, &shared, &limiter, &self.cfg, &marker, part);
             }
-            if joinset.is_empty() && shared.queue.lock().is_empty() {
+            if shared.running.load(Ordering::SeqCst) == 0 && shared.queue.lock().is_empty() {
                 break;
             }
-            match tokio::time::timeout(Duration::from_millis(200), joinset.join_next()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    if last_state_save.elapsed() >= Duration::from_secs(1) {
-                        last_state_save = Instant::now();
-                        shared.save_state(&temp_dir);
-                    }
-                }
+            // 回收已结束的线程
+            handles.retain(|h| !h.is_finished());
+            if last_state_save.elapsed() >= Duration::from_secs(1) {
+                last_state_save = Instant::now();
+                shared.save_state(&temp_dir);
             }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        // 收工：等所有工人退出（取消 / 出错时它们会很快看到标志）
+        for h in handles.drain(..) {
+            let _ = h.join();
         }
 
         if let Some(e) = shared.first_err.lock().take() {
@@ -296,11 +312,7 @@ impl Engine {
         })
     }
 
-    fn setup_paths(
-        &self,
-        req: &Request,
-        pi: &crate::client::ProbeInfo,
-    ) -> Result<(PathBuf, PathBuf)> {
+    fn setup_paths(&self, req: &Request, pi: &ProbeInfo) -> Result<(PathBuf, PathBuf)> {
         let final_path = match &req.target_file {
             Some(f) if !f.is_empty() => PathBuf::from(f),
             _ => {
@@ -334,7 +346,7 @@ impl Engine {
     fn prepare_parts(
         &self,
         shared: &Arc<Shared>,
-        pi: &crate::client::ProbeInfo,
+        pi: &ProbeInfo,
         temp_dir: &Path,
         marker: &Path,
     ) -> Result<()> {
@@ -405,20 +417,16 @@ impl Engine {
         Ok(())
     }
 
-    async fn download_whole(
-        &self,
-        shared: &Arc<Shared>,
-        marker: &Path,
-    ) -> Result<()> {
+    fn download_whole(&self, shared: &Arc<Shared>, marker: &Path) -> Result<()> {
         let mut last_err: Option<Error> = None;
         for attempt in 0..=self.cfg.max_retries {
             if shared.is_canceled() {
                 return Err(Error::canceled());
             }
             if attempt > 0 {
-                tokio::time::sleep(self.cfg.retry_delay).await;
+                thread::sleep(self.cfg.retry_delay);
             }
-            match self.download_whole_once(shared, marker).await {
+            match self.download_whole_once(shared, marker) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.is_retryable() => last_err = Some(e),
                 Err(e) => return Err(e),
@@ -430,34 +438,29 @@ impl Engine {
         ))
     }
 
-    async fn download_whole_once(
-        &self,
-        shared: &Arc<Shared>,
-        marker: &Path,
-    ) -> Result<()> {
-        let (http, source, src_idx) = shared.pick_source();
+    fn download_whole_once(&self, shared: &Arc<Shared>, marker: &Path) -> Result<()> {
+        let (be, ep, src_idx) = shared.pick_source();
         let headers = shared.headers();
-        let mut resp = http.open_plain(&source, &headers).await?;
+        let mut body = be.open_plain(&ep, &headers)?;
         let mut file = File::create(marker).map_err(|e| fatal("create", format!("创建文件失败: {e}")))?;
         shared.downloaded.store(0, Ordering::SeqCst);
+        let mut buf = vec![0u8; self.cfg.buffer_size.max(64 * 1024)];
         loop {
             if shared.is_canceled() {
                 return Err(Error::canceled());
             }
             if shared.is_paused() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                thread::sleep(Duration::from_millis(50));
                 continue;
             }
-            match resp.chunk().await {
-                Ok(Some(b)) => {
-                    file.write_all(&b).map_err(|e| fatal("write", format!("{e}")))?;
-                    shared.add_downloaded(b.len() as i64);
-                    shared.add_src_bytes(src_idx, b.len() as i64);
+            match body.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    file.write_all(&buf[..n]).map_err(|e| fatal("write", format!("{e}")))?;
+                    shared.add_downloaded(n as i64);
+                    shared.add_src_bytes(src_idx, n as i64);
                 }
-                Ok(None) => return Ok(()),
-                Err(e) => {
-                    return Err(retryable("read", format!("{e}")));
-                }
+                Err(e) => return Err(retryable("read", format!("{e}"))),
             }
         }
     }
@@ -484,8 +487,9 @@ struct Shared {
     last_mod: Lock<String>,
     prog: Lock<ProgState>,
     log_mu: Lock<()>,
-    // 来源池（主地址 + 镜像/多 IP）与轮转计数
-    http: std::sync::OnceLock<Arc<HttpClient>>,
+    // 网络后端 + 来源池（主地址 + 镜像/多 IP）与轮转计数
+    backend: std::sync::OnceLock<Arc<dyn Backend>>,
+    endpoints: std::sync::OnceLock<Vec<Endpoint>>,
     headers: std::sync::OnceLock<Vec<(String, String)>>,
     src_next: AtomicUsize,
     // 诊断用：每个来源的标签、累计字节、连接次数
@@ -519,7 +523,8 @@ impl Shared {
             last_mod: Lock::new(String::new()),
             prog: Lock::new(ProgState { last_emit: Instant::now(), last_emit_bytes: 0 }),
             log_mu: Lock::new(()),
-            http: std::sync::OnceLock::new(),
+            backend: std::sync::OnceLock::new(),
+            endpoints: std::sync::OnceLock::new(),
             headers: std::sync::OnceLock::new(),
             src_next: AtomicUsize::new(0),
             src_labels: std::sync::OnceLock::new(),
@@ -549,17 +554,18 @@ impl Shared {
     }
 
     /// 轮换取一个下载来源（多 IP / 镜像之间轮转），返回其下标供统计
-    fn pick_source(&self) -> (Arc<HttpClient>, Source, usize) {
-        let http = self.http.get().expect("http 未初始化").clone();
-        let n = http.source_count().max(1);
+    fn pick_source(&self) -> (Arc<dyn Backend>, Endpoint, usize) {
+        let be = self.backend.get().expect("backend 未初始化").clone();
+        let eps = self.endpoints.get().expect("endpoints 未初始化");
+        let n = eps.len().max(1);
         let idx = self.src_next.fetch_add(1, Ordering::SeqCst) % n;
-        let s = http.source(idx).clone();
+        let ep = eps[idx].clone();
         if let Some(v) = self.src_conns.get() {
             if let Some(c) = v.get(idx) {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }
-        (http, s, idx)
+        (be, ep, idx)
     }
 
     fn add_src_bytes(&self, idx: usize, n: i64) {
@@ -674,7 +680,7 @@ fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
 }
 
 fn spawn_part(
-    joinset: &mut tokio::task::JoinSet<()>,
+    handles: &mut Vec<JoinHandle<()>>,
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
@@ -691,8 +697,8 @@ fn spawn_part(
     };
     s.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
     s.running.fetch_add(1, Ordering::SeqCst);
-    joinset.spawn(async move {
-        let res = run_part(&s, &l, &cfg, &dir, &part).await;
+    let handle = thread::spawn(move || {
+        let res = run_part(&s, &l, &cfg, &dir, &part);
         s.running.fetch_sub(1, Ordering::SeqCst);
         match res {
             Ok(()) => s.logf("DEBUG", format!("工人结束（完成）：段 [{from}, {to}]")),
@@ -708,9 +714,10 @@ fn spawn_part(
             }
         }
     });
+    handles.push(handle);
 }
 
-async fn run_part(
+fn run_part(
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
@@ -723,13 +730,13 @@ async fn run_part(
             return Err(Error::canceled());
         }
         if attempt > 0 {
-            tokio::time::sleep(cfg.retry_delay).await;
+            thread::sleep(cfg.retry_delay);
         }
         let (from, to, cur) = {
             let p = part.lock();
             (p.from, p.to, p.current)
         };
-        match download_part_once(shared, limiter, cfg, out_file, part).await {
+        match download_part_once(shared, limiter, cfg, out_file, part) {
             Ok(()) => {
                 if part.lock().done() {
                     return Ok(());
@@ -752,7 +759,7 @@ async fn run_part(
     ))
 }
 
-async fn download_part_once(
+fn download_part_once(
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
@@ -771,23 +778,23 @@ async fn download_part_once(
             return Ok(());
         }
         // 每次（重）连接都轮换一个来源：多 IP / 镜像之间轮转
-        let (http, source, src_idx) = shared.pick_source();
+        let (be, ep, src_idx) = shared.pick_source();
         let headers = shared.headers();
-        let resp = match http.open_range(&source, &headers, current, to).await {
-            Ok(r) => r,
+        let body = match be.open_range(&ep, &headers, current, to) {
+            Ok(b) => b,
             Err(e) => {
                 shared.logf(
                     "WARN",
                     format!(
                         "打开分段连接失败（来源 {}）：段 [{from}, {to}]，从 {current} 开始，错误={e}",
-                        source.label
+                        ep.label
                     ),
                 );
                 return Err(e);
             }
         };
         let watch = reconnects < MAX_SLOW_RECONNECTS;
-        match pump(shared, limiter, cfg, part, &mut file, resp, watch, src_idx).await {
+        match pump(shared, limiter, cfg, part, &mut file, body, watch, src_idx) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind == ErrorKind::Slow => {
                 reconnects += 1;
@@ -798,13 +805,14 @@ async fn download_part_once(
     }
 }
 
-async fn pump(
+#[allow(clippy::too_many_arguments)]
+fn pump(
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
     part: &Arc<Lock<Part>>,
     file: &mut File,
-    mut resp: reqwest::Response,
+    mut body: Box<dyn Read + Send>,
     watch_slow: bool,
     src_idx: usize,
 ) -> Result<()> {
@@ -812,7 +820,7 @@ async fn pump(
     let mut pending_off = 0usize;
     let mut window_start = Instant::now();
     let mut window_bytes = 0i64;
-    let _ = cfg;
+    let mut buf = vec![0u8; cfg.buffer_size.max(64 * 1024)];
 
     loop {
         if shared.is_canceled() {
@@ -822,7 +830,7 @@ async fn pump(
             // 暂停：连接保持、不计数；恢复后继续
             window_start = Instant::now();
             window_bytes = 0;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            thread::sleep(Duration::from_millis(50));
             continue;
         }
         let (to, current, safe_zone) = {
@@ -845,25 +853,23 @@ async fn pump(
         }
 
         if pending_off >= pending.len() {
-            match resp.chunk().await {
-                Ok(Some(b)) => {
-                    pending = b.to_vec();
-                    pending_off = 0;
-                    if pending.is_empty() {
-                        continue;
-                    }
-                }
-                Ok(None) => {
+            match body.read(&mut buf) {
+                Ok(0) => {
                     if part.lock().done() {
                         return Ok(());
                     }
                     return Err(retryable("read", "连接提前结束"));
                 }
+                Ok(n) => {
+                    pending.clear();
+                    pending.extend_from_slice(&buf[..n]);
+                    pending_off = 0;
+                }
                 Err(e) => {
-                    if e.is_timeout() {
+                    if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
                         shared.logf("WARN", "连接卡住（空闲超时）");
                     }
-                    return Err(retryable("read", format!("{e:?}")));
+                    return Err(retryable("read", format!("{e}")));
                 }
             }
         }

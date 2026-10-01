@@ -9,6 +9,7 @@
 
 # Rust 构建产物
 target/
+target-lts/
 
 # C 编译中间物
 *.obj

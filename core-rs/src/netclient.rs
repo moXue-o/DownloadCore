@@ -13,6 +13,7 @@
 //!
 //! 这里只负责"把 HTTP 说明白"；分段、续传、看门狗、写文件等仍由引擎负责。
 
+use crate::backend::{Backend, Endpoint};
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -24,15 +25,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: usize = 500;
 
-/// 探路结果（与框架版保持同一形状，便于两版后端接口统一）。
-#[derive(Debug, Clone)]
-pub struct ProbeInfo {
-    pub size: i64,
-    pub range_ok: bool,
-    pub etag: String,
-    pub last_modified: String,
-    pub file_name: String,
-}
+/// 探路结果：两个后端共用同一形状（定义在 `backend`）。
+pub use crate::backend::ProbeInfo;
 
 /// 一个下载目标：网址 +（可选）绑定到某个 IP。
 /// 多 IP / 镜像并行时，由上层为每个来源建一个 Target。
@@ -524,4 +518,34 @@ fn resolve(base: &ParsedUrl, location: &str) -> String {
         None => "/",
     };
     format!("{}{}{}", base.origin, dir, loc)
+}
+
+// ---------------- 接入统一后端接口 ----------------
+
+fn to_target(ep: &Endpoint) -> Target {
+    Target { url: ep.url.clone(), ip: ep.ip }
+}
+
+impl Backend for NetClient {
+    fn name(&self) -> &'static str {
+        "native"
+    }
+
+    fn probe(&self, ep: &Endpoint) -> Result<ProbeInfo> {
+        NetClient::probe(self, &to_target(ep), &[])
+    }
+
+    fn open_range(
+        &self,
+        ep: &Endpoint,
+        headers: &[(String, String)],
+        from: i64,
+        to: i64,
+    ) -> Result<Box<dyn Read + Send>> {
+        Ok(Box::new(NetClient::open_range(self, &to_target(ep), headers, from, to)?))
+    }
+
+    fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>> {
+        Ok(Box::new(NetClient::open_plain(self, &to_target(ep), headers)?))
+    }
 }
