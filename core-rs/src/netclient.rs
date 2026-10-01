@@ -21,7 +21,8 @@ use crate::util::{parse_content_range, parse_filename};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_REDIRECTS: usize = 10;
@@ -76,6 +77,15 @@ pub struct NetClient {
     pool: Pool,
     /// 跳转缓存：原始地址 -> 跳转后的真实地址（省掉每分段的一跳）。
     final_cache: Mutex<HashMap<String, (String, Instant)>>,
+    /// 系统 TLS 连接器：只建一次，反复用（别每条连接都重建）。
+    tls: OnceLock<native_tls::TlsConnector>,
+    // 诊断计数
+    stat_connects: AtomicUsize,
+    stat_tls: AtomicUsize,
+    stat_pool_hits: AtomicUsize,
+    stat_final_hits: AtomicUsize,
+    stat_follows: AtomicUsize,
+    stat_conn_fail: AtomicUsize,
 }
 
 impl NetClient {
@@ -86,6 +96,13 @@ impl NetClient {
             bad: Mutex::new(HashMap::new()),
             pool: Arc::new(Mutex::new(HashMap::new())),
             final_cache: Mutex::new(HashMap::new()),
+            tls: OnceLock::new(),
+            stat_connects: AtomicUsize::new(0),
+            stat_tls: AtomicUsize::new(0),
+            stat_pool_hits: AtomicUsize::new(0),
+            stat_final_hits: AtomicUsize::new(0),
+            stat_follows: AtomicUsize::new(0),
+            stat_conn_fail: AtomicUsize::new(0),
         }
     }
 
@@ -166,6 +183,7 @@ impl NetClient {
     ) -> Result<(u16, Vec<(String, String)>, Body)> {
         if let Some(final_url) = self.cached_final(url) {
             if final_url != url {
+                self.stat_final_hits.fetch_add(1, Ordering::Relaxed);
                 if let Ok((status, hdrs, body, _)) =
                     self.request_follow(&final_url, None, headers, range)
                 {
@@ -228,6 +246,7 @@ impl NetClient {
             let loc = header_get(&hdrs, "location");
             if matches!(status, 301 | 302 | 303 | 307 | 308) && !loc.is_empty() {
                 let next = resolve(&u, loc);
+                self.stat_follows.fetch_add(1, Ordering::Relaxed);
                 // 跳转用的连接也回收：否则每个分段都要重新和"跳转服务器"握手
                 self.recycle_conn(reader, &key, &hdrs);
                 current = next;
@@ -267,6 +286,7 @@ impl NetClient {
             if let Some(v) = m.get_mut(key) {
                 while let Some(p) = v.pop() {
                     if p.idle.elapsed() < POOL_IDLE_MAX {
+                        self.stat_pool_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok((p.reader, true));
                     }
                     // 过期的直接丢弃
@@ -333,11 +353,13 @@ impl NetClient {
                 Ok(s) => {
                     // 通了 → 解除冷宫
                     self.bad.lock().unwrap_or_else(|e| e.into_inner()).remove(ip);
+                    self.stat_connects.fetch_add(1, Ordering::Relaxed);
                     tcp = Some(s);
                     break;
                 }
                 Err(e) => {
                     last = e.to_string();
+                    self.stat_conn_fail.fetch_add(1, Ordering::Relaxed);
                     // 失败 → 进冷宫，短时间内不再优先尝试
                     self.bad.lock().unwrap_or_else(|e| e.into_inner()).insert(*ip, Instant::now());
                 }
@@ -349,11 +371,19 @@ impl NetClient {
         let _ = tcp.set_write_timeout(Some(WRITE_TIMEOUT));
 
         if u.https {
-            let connector = native_tls::TlsConnector::new()
-                .map_err(|e| fatal("tls", format!("初始化系统 TLS 失败: {e}")))?;
+            let connector = match self.tls.get() {
+                Some(c) => c,
+                None => {
+                    let c = native_tls::TlsConnector::new()
+                        .map_err(|e| fatal("tls", format!("初始化系统 TLS 失败: {e}")))?;
+                    let _ = self.tls.set(c);
+                    self.tls.get().expect("刚设置")
+                }
+            };
             let tls = connector
                 .connect(&u.host, tcp)
                 .map_err(|e| retryable("tls", format!("TLS 握手失败: {e}")))?;
+            self.stat_tls.fetch_add(1, Ordering::Relaxed);
             Ok(Stream::Tls(Box::new(tls)))
         } else {
             Ok(Stream::Plain(tcp))
@@ -757,5 +787,17 @@ impl Backend for NetClient {
 
     fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>> {
         Ok(Box::new(NetClient::open_plain(self, &to_target(ep), headers)?))
+    }
+
+    fn stats(&self) -> String {
+        format!(
+            "native 新建TCP={} TLS握手={} 池复用={} 跳转缓存命中={} 跟随跳转={} 连接失败={}",
+            self.stat_connects.load(Ordering::Relaxed),
+            self.stat_tls.load(Ordering::Relaxed),
+            self.stat_pool_hits.load(Ordering::Relaxed),
+            self.stat_final_hits.load(Ordering::Relaxed),
+            self.stat_follows.load(Ordering::Relaxed),
+            self.stat_conn_fail.load(Ordering::Relaxed),
+        )
     }
 }

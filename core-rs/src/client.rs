@@ -15,6 +15,7 @@ use crate::util::{parse_content_range, parse_filename};
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -35,6 +36,9 @@ pub struct LtsBackend {
     clients: Mutex<HashMap<String, reqwest::Client>>,
     /// 跳转缓存：原始地址 -> 跳转后的真实地址（省掉每分段的一跳）。
     final_cache: Mutex<HashMap<String, (String, Instant)>>,
+    // 诊断计数
+    stat_final_hits: AtomicUsize,
+    stat_client_builds: AtomicUsize,
 }
 
 impl LtsBackend {
@@ -51,6 +55,8 @@ impl LtsBackend {
             max_threads: cfg.max_threads.max(1),
             clients: Mutex::new(HashMap::new()),
             final_cache: Mutex::new(HashMap::new()),
+            stat_final_hits: AtomicUsize::new(0),
+            stat_client_builds: AtomicUsize::new(0),
         })
     }
 
@@ -78,6 +84,7 @@ impl LtsBackend {
         let client =
             b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
         self.clients.lock().unwrap_or_else(|e| e.into_inner()).insert(key, client.clone());
+        self.stat_client_builds.fetch_add(1, Ordering::Relaxed);
         Ok(client)
     }
 
@@ -98,8 +105,12 @@ impl LtsBackend {
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<reqwest::Response> {
-        let (url, ip) = match self.cached_final(&ep.url) {
-            Some(f) if f != ep.url => (f, None), // 用真实地址，不再 pin 原始主机
+        let cached = self.cached_final(&ep.url);
+        let (url, ip) = match &cached {
+            Some(f) if f.as_str() != ep.url => {
+                self.stat_final_hits.fetch_add(1, Ordering::Relaxed);
+                (f.clone(), None) // 用真实地址，不再 pin 原始主机
+            }
             _ => (ep.url.clone(), ep.ip),
         };
         let client = self.client_for(&url, ip)?;
@@ -238,6 +249,14 @@ impl Backend for LtsBackend {
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
         Ok(Box::new(self.body(resp)))
+    }
+
+    fn stats(&self) -> String {
+        format!(
+            "lts 新建Client={} 跳转缓存命中={}",
+            self.stat_client_builds.load(Ordering::Relaxed),
+            self.stat_final_hits.load(Ordering::Relaxed),
+        )
     }
 }
 

@@ -117,6 +117,7 @@ impl Engine {
                 shared.status(Status::Failed);
                 return Err(e);
             }
+            shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
             if let Err(e) = move_into_place(&marker, &final_path) {
                 shared.status(Status::Failed);
                 return Err(e);
@@ -262,6 +263,7 @@ impl Engine {
         for h in handles.drain(..) {
             let _ = h.join();
         }
+        shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
 
         if let Some(e) = shared.first_err.lock().take() {
             shared.save_state(&temp_dir);

@@ -47,6 +47,10 @@ pub trait Backend: Send + Sync {
     ) -> Result<Box<dyn Read + Send>>;
     /// 整文件不分段的字节流。
     fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>>;
+    /// 一行人类可读的网络统计（新建连接/TLS/复用/跳转等），供日志诊断。
+    fn stats(&self) -> String {
+        String::new()
+    }
 }
 
 /// 从网址里取主机名（去掉协议、userinfo、端口、路径、查询、锚点）。
