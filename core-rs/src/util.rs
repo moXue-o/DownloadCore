@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 解析 "bytes start-end/total"。
 pub fn parse_content_range(v: &str) -> Option<(i64, i64, i64)> {
@@ -111,14 +111,6 @@ pub fn job_key(abs: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
-}
-
-pub fn pad_from(from: i64) -> String {
-    format!("{from:019}")
-}
-
-pub fn part_file_name(dir: &Path, from: i64) -> PathBuf {
-    dir.join(pad_from(from))
 }
 
 use std::sync::{Mutex, MutexGuard};

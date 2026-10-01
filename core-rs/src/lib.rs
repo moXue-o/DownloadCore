@@ -9,6 +9,7 @@ mod engine;
 mod errors;
 mod ffi;
 mod limiter;
+pub mod netclient;
 mod part;
 mod split;
 mod store;
