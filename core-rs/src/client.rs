@@ -3,23 +3,35 @@
 //! 定位与自研后端完全一致（同一套引擎、同一个 C 接口、同样功能），
 //! 区别只在"上网这一层"用了成熟框架——稳、边角全，但体积大。
 //!
-//! 引擎是"一个工人一条线程"的阻塞模型，所以这里把一个共享的多线程运行时
-//! 借来驱动 reqwest 的异步调用：`block_on` 只负责把这条线程的活跑完，
-//! 真正的 I/O 由运行时的工作线程处理。这样两种后端可以套同一个引擎。
+//! 引擎是"一个工人一条线程"的阻塞模型，这里用两种手段把它接好、且不拖后腿：
+//!   1. **按来源缓存并复用 `reqwest::Client`** → 连接池/keep-alive 生效，
+//!      同一条长连接上的分段、重试、重连都能复用 TCP+TLS，不再每次从头握手；
+//!   2. **响应体走 channel 流式转交**：由运行时的工作线程驱动 `chunk().await`，
+//!      阻塞读这边只是收数据——避免"每读一块就 block_on 一次"的调度开销。
 
 use crate::backend::{host_of, port_of, Backend, Endpoint, ProbeInfo};
 use crate::config::Config;
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::mpsc;
+
+/// 连接超时：与自研后端一致（短超时，避免个别地址连不通时干等）。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+/// 连接池里每条来源最多留多少条空闲长连接。
+const POOL_IDLE_SECS: u64 = 90;
 
 pub struct LtsBackend {
     rt: Arc<tokio::runtime::Runtime>,
     user_agent: String,
     idle_timeout: Duration,
+    max_threads: usize,
+    /// 按 "host|ip" 缓存客户端：连同一个来源的请求复用同一个连接池。
+    clients: Mutex<HashMap<String, reqwest::Client>>,
 }
 
 impl LtsBackend {
@@ -33,24 +45,65 @@ impl LtsBackend {
             rt: Arc::new(rt),
             user_agent: cfg.user_agent.clone(),
             idle_timeout: cfg.idle_timeout,
+            max_threads: cfg.max_threads.max(1),
+            clients: Mutex::new(HashMap::new()),
         })
     }
 
     fn client_for(&self, ep: &Endpoint) -> Result<reqwest::Client> {
+        let host = host_of(&ep.url).unwrap_or_default();
+        let key = format!("{host}|{}", ep.ip.map(|i| i.to_string()).unwrap_or_default());
+        if let Some(c) = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(c.clone());
+        }
+
         let mut b = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(self.idle_timeout)
             .redirect(reqwest::redirect::Policy::limited(10))
+            .pool_max_idle_per_host(self.max_threads)
+            .pool_idle_timeout(Duration::from_secs(POOL_IDLE_SECS))
             .http1_only()
             // 不使用系统代理：代理属于宿主/系统的设置，应由宿主显式决定
             .no_proxy();
         if let Some(ip) = ep.ip {
-            if let Some(host) = host_of(&ep.url) {
+            if !host.is_empty() {
                 b = b.resolve(&host, SocketAddr::new(ip, port_of(&ep.url)));
             }
         }
-        b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))
+        let client =
+            b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
+        self.clients.lock().unwrap_or_else(|e| e.into_inner()).insert(key, client.clone());
+        Ok(client)
     }
+
+    /// 把响应体交给运行时异步读取，再经 channel 流式转给阻塞读（有背压）。
+    fn body(&self, resp: reqwest::Response) -> LtsBody {
+        let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(8);
+        self.rt.spawn(async move {
+            let mut resp = resp;
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(b)) => {
+                        if tx.send(Ok(b.to_vec())).await.is_err() {
+                            return; // 读端已关闭
+                        }
+                    }
+                    Ok(None) => return, // 正常结束 → 丢掉 tx，读端收到"结束"
+                    Err(e) => {
+                        let _ = tx.send(Err(reqwest_to_io(e))).await;
+                        return;
+                    }
+                }
+            }
+        });
+        LtsBody { rx, buf: Vec::new(), off: 0 }
+    }
+}
+
+fn reqwest_to_io(e: reqwest::Error) -> io::Error {
+    let kind = if e.is_timeout() { io::ErrorKind::TimedOut } else { io::ErrorKind::Other };
+    io::Error::new(kind, e.to_string())
 }
 
 fn header_str(resp: &reqwest::Response, name: &str) -> String {
@@ -149,7 +202,7 @@ impl Backend for LtsBackend {
                 format!("{ERR_RANGE_MISMATCH}: 期望起点 {from}，服务器给了 {start}"),
             ));
         }
-        Ok(Box::new(LtsBody { rt: self.rt.clone(), resp, buf: Vec::new(), off: 0 }))
+        Ok(Box::new(self.body(resp)))
     }
 
     fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>> {
@@ -175,34 +228,30 @@ impl Backend for LtsBackend {
         if !(200..300).contains(&status) {
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
-        Ok(Box::new(LtsBody { rt: self.rt.clone(), resp, buf: Vec::new(), off: 0 }))
+        Ok(Box::new(self.body(resp)))
     }
 }
 
-/// 把 reqwest 的响应体包装成阻塞式 `Read`：每次要数据就 `block_on` 拉一块。
+/// 阻塞式响应体：从 channel 收数据；channel 关闭即"结束"。
 struct LtsBody {
-    rt: Arc<tokio::runtime::Runtime>,
-    resp: reqwest::Response,
+    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
     buf: Vec<u8>,
     off: usize,
 }
 
 impl Read for LtsBody {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.off >= self.buf.len() {
-            match self.rt.block_on(self.resp.chunk()) {
-                Ok(Some(b)) => {
-                    self.buf = b.to_vec();
+        while self.off >= self.buf.len() {
+            match self.rx.blocking_recv() {
+                Some(Ok(b)) => {
+                    self.buf = b;
                     self.off = 0;
+                    if self.buf.is_empty() {
+                        return Ok(0);
+                    }
                 }
-                Ok(None) => return Ok(0),
-                Err(e) => {
-                    let kind = if e.is_timeout() { io::ErrorKind::TimedOut } else { io::ErrorKind::Other };
-                    return Err(io::Error::new(kind, e.to_string()));
-                }
-            }
-            if self.buf.is_empty() {
-                return Ok(0);
+                Some(Err(e)) => return Err(e),
+                None => return Ok(0), // channel 关闭：读完
             }
         }
         let n = (self.buf.len() - self.off).min(out.len());

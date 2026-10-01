@@ -5,10 +5,12 @@
 //!   · `open_range` —— 打开某一段的字节流，并"对暗号"（起点必须一致）
 //!   · `open_plain` —— 整文件不分段的字节流（服务器不支持分段时兜底）
 //!
-//! 设计取舍（为了"小 + 可控"）：
+//! 设计取舍（为了"小 + 可控 + 不慢"）：
 //!   · **阻塞式**：一条连接一个线程，天然吻合"每段一个工人"的模型，甩掉异步运行时；
 //!   · **系统 TLS**：Windows 走 Schannel（系统自带），不自己实现加密；
-//!   · **用后即关**（Connection: close）：逻辑简单；引擎本身"每段一条长连接"，不需要连接池；
+//!   · **keep-alive 连接池**：同来源的连接用完回收、下次复用，避免"每段/每次重试都重新
+//!     握手"，高并发下也不至于被丢 SYN；
+//!   · **坏地址冷宫**：某 IP 连不通就短期不再优先尝试，并自动改连同域其它 IP；
 //!   · **卡住检测更准**：直接设套接字读超时，一次 read 超时即可判定（框架做不到这么细）。
 //!
 //! 这里只负责"把 HTTP 说明白"；分段、续传、看门狗、写文件等仍由引擎负责。
@@ -19,7 +21,7 @@ use crate::util::{parse_content_range, parse_filename};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_REDIRECTS: usize = 10;
@@ -29,6 +31,10 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
 const BAD_ADDR_COOLDOWN: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: usize = 500;
+/// 每个来源最多缓存多少条空闲长连接
+const POOL_MAX_IDLE: usize = 8;
+/// 空闲连接最长留多久
+const POOL_IDLE_MAX: Duration = Duration::from_secs(30);
 
 /// 探路结果：两个后端共用同一形状（定义在 `backend`）。
 pub use crate::backend::ProbeInfo;
@@ -50,12 +56,22 @@ impl Target {
     }
 }
 
-/// 自研 HTTP 客户端。无连接池；可自由跨线程共享（`&self` 即可）。
+/// 一条回收回来的空闲连接。
+struct Pooled {
+    reader: BufReader<Stream>,
+    idle: Instant,
+}
+
+type Pool = Arc<Mutex<HashMap<String, Vec<Pooled>>>>;
+
+/// 自研 HTTP 客户端。带 keep-alive 连接池，可自由跨线程共享（`&self` 即可）。
 pub struct NetClient {
     user_agent: String,
     idle_timeout: Duration,
     /// "冷宫"：连接失败过的 IP 及其失败时刻，短时间内不再优先尝试。
     bad: Mutex<HashMap<IpAddr, Instant>>,
+    /// keep-alive 连接池：按 "host:port|ip" 复用连接。
+    pool: Pool,
 }
 
 impl NetClient {
@@ -64,6 +80,7 @@ impl NetClient {
             user_agent: user_agent.into(),
             idle_timeout,
             bad: Mutex::new(HashMap::new()),
+            pool: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -144,28 +161,76 @@ impl NetClient {
         let mut current = url.to_string();
         for _ in 0..=MAX_REDIRECTS {
             let u = parse_url(&current)?;
-            let mut stream = BufReader::new(self.connect(&u, pin)?);
-            let req = build_request(&u, &self.user_agent, headers, range);
-            stream
-                .get_mut()
-                .write_all(req.as_bytes())
-                .map_err(|e| map_io("request", e))?;
-            stream.get_mut().flush().map_err(|e| map_io("request", e))?;
+            let key = conn_key(&u, pin);
 
-            let status = read_status_line(&mut stream)?;
-            let hdrs = read_headers(&mut stream)?;
+            // 复用连接可能已被对端关掉：失败一次就换新连接重试（最多两次）
+            let mut got = None;
+            for attempt in 0..2 {
+                let (mut reader, reused) = self.take_conn(&key, &u, pin)?;
+                match self.exchange(&mut reader, &u, headers, range) {
+                    Ok((status, hdrs)) => {
+                        got = Some((reader, status, hdrs));
+                        break;
+                    }
+                    Err(e) => {
+                        if reused && attempt == 0 {
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            let (reader, status, hdrs) =
+                got.ok_or_else(|| retryable("request", "请求失败：无法建立连接"))?;
 
             let loc = header_get(&hdrs, "location");
             if matches!(status, 301 | 302 | 303 | 307 | 308) && !loc.is_empty() {
                 let next = resolve(&u, loc);
-                drop(stream); // 关掉旧连接
+                drop(reader); // 跳转连接不回收，简单起见
                 current = next;
                 continue;
             }
-            let body = Body::new(stream, &hdrs);
+
+            let keep = wants_keep_alive(&hdrs);
+            let body = Body::new(reader, &hdrs, keep, Some((self.pool.clone(), key)));
             return Ok((status, hdrs, body));
         }
         Err(retryable("redirect", "跳转次数过多"))
+    }
+
+    /// 写请求 + 读状态行/响应头（连接池复用与新建共用这段）。
+    fn exchange(
+        &self,
+        reader: &mut BufReader<Stream>,
+        u: &ParsedUrl,
+        headers: &[(String, String)],
+        range: Option<(i64, i64)>,
+    ) -> Result<(u16, Vec<(String, String)>)> {
+        let req = build_request(u, &self.user_agent, headers, range);
+        reader
+            .get_mut()
+            .write_all(req.as_bytes())
+            .map_err(|e| map_io("request", e))?;
+        reader.get_mut().flush().map_err(|e| map_io("request", e))?;
+        let status = read_status_line(reader)?;
+        let hdrs = read_headers(reader)?;
+        Ok((status, hdrs))
+    }
+
+    /// 从池里取一条（仍新鲜）的连接；没有就新建。
+    fn take_conn(&self, key: &str, u: &ParsedUrl, pin: Option<IpAddr>) -> Result<(BufReader<Stream>, bool)> {
+        {
+            let mut m = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = m.get_mut(key) {
+                while let Some(p) = v.pop() {
+                    if p.idle.elapsed() < POOL_IDLE_MAX {
+                        return Ok((p.reader, true));
+                    }
+                    // 过期的直接丢弃
+                }
+            }
+        }
+        Ok((BufReader::new(self.connect(u, pin)?), false))
     }
 
     fn connect(&self, u: &ParsedUrl, pin: Option<IpAddr>) -> Result<Stream> {
@@ -287,13 +352,21 @@ enum Mode {
 }
 
 /// 响应体：实现 `Read`，屏蔽"定长/分块/读到尾"三种情况。
+/// 读完且连接可复用时，`Drop` 会把连接还回连接池。
 pub struct Body {
-    inner: BufReader<Stream>,
+    inner: Option<BufReader<Stream>>,
     mode: Mode,
+    keep_alive: bool,
+    recycle: Option<(Pool, String)>,
 }
 
 impl Body {
-    fn new(inner: BufReader<Stream>, headers: &[(String, String)]) -> Body {
+    fn new(
+        inner: BufReader<Stream>,
+        headers: &[(String, String)],
+        keep_alive: bool,
+        recycle: Option<(Pool, String)>,
+    ) -> Body {
         let te = header_get(headers, "transfer-encoding").to_ascii_lowercase();
         let mode = if te.contains("chunked") {
             Mode::Chunked { remaining: 0, done: false, need_crlf: false }
@@ -302,7 +375,7 @@ impl Body {
         } else {
             Mode::Eof
         };
-        Body { inner, mode }
+        Body { inner: Some(inner), mode, keep_alive, recycle }
     }
 }
 
@@ -312,9 +385,40 @@ impl Read for Body {
             return Ok(0);
         }
         let mut mode = std::mem::replace(&mut self.mode, Mode::Eof);
-        let r = read_mode(&mut self.inner, &mut mode, buf);
+        let inner = self.inner.as_mut().expect("响应体已释放");
+        let r = read_mode(inner, &mut mode, buf);
         self.mode = mode;
         r
+    }
+}
+
+impl Drop for Body {
+    fn drop(&mut self) {
+        if !self.keep_alive {
+            return;
+        }
+        // 只有"整段读完"才可复用；另外缓冲区里不能有残留字节（否则会串味）
+        let reusable = match &self.mode {
+            Mode::Length(n) => *n == 0,
+            Mode::Chunked { done, .. } => *done,
+            Mode::Eof => false,
+        };
+        let (pool, key) = match self.recycle.take() {
+            Some(x) => x,
+            None => return,
+        };
+        let reader = match self.inner.take() {
+            Some(r) => r,
+            None => return,
+        };
+        if !reusable || !reader.buffer().is_empty() {
+            return;
+        }
+        let mut m = pool.lock().unwrap_or_else(|e| e.into_inner());
+        let v = m.entry(key).or_default();
+        if v.len() < POOL_MAX_IDLE {
+            v.push(Pooled { reader, idle: Instant::now() });
+        }
     }
 }
 
@@ -425,6 +529,15 @@ fn header_get<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
         .unwrap_or("")
 }
 
+/// HTTP/1.1 默认长连接；只有服务器明说 close 才不复用。
+fn wants_keep_alive(headers: &[(String, String)]) -> bool {
+    !header_get(headers, "connection").to_ascii_lowercase().contains("close")
+}
+
+fn conn_key(u: &ParsedUrl, pin: Option<IpAddr>) -> String {
+    format!("{}:{}|{}", u.host, u.port, pin.map(|i| i.to_string()).unwrap_or_default())
+}
+
 fn build_request(
     u: &ParsedUrl,
     user_agent: &str,
@@ -444,10 +557,9 @@ fn build_request(
     s.push_str(&format!("User-Agent: {user_agent}\r\n"));
     s.push_str("Accept: */*\r\n");
     s.push_str("Accept-Encoding: identity\r\n");
-    s.push_str("Connection: close\r\n");
 
     for (k, v) in headers {
-        // host/range 由我们自己控制，避免重复或误覆盖
+        // host/range/connection 由我们自己控制，避免重复或误覆盖
         if k.eq_ignore_ascii_case("host")
             || k.eq_ignore_ascii_case("range")
             || k.eq_ignore_ascii_case("connection")

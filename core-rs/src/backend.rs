@@ -6,7 +6,7 @@
 //! 引擎、分段、续传、看门狗、写文件等全部与后端无关，因此"写一次代码、打包两个版本"。
 
 use crate::config::Config;
-use crate::errors::Result;
+use crate::errors::{retryable, Result};
 use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 
@@ -124,6 +124,9 @@ fn same_file(a: &ProbeInfo, b: &ProbeInfo) -> bool {
 }
 
 /// 建来源池并探路。镜像只有"与主源是同一文件"才被采纳。
+///
+/// 探路本身也会重试：依次试池里所有地址，失败就换下一个；全都不行再等一会儿重来。
+/// （探路失败=整个任务失败，所以不能"只试一次"。两个后端共用此逻辑。）
 pub fn build_pool(
     be: &dyn Backend,
     cfg: &Config,
@@ -131,7 +134,30 @@ pub fn build_pool(
     mirrors: &[String],
 ) -> Result<(Vec<Endpoint>, ProbeInfo)> {
     let mut eps = sources_for(cfg, primary);
-    let info = be.probe(&eps[0])?;
+
+    let rounds = cfg.max_retries.clamp(1, 3);
+    let mut info: Option<ProbeInfo> = None;
+    let mut last_err = None;
+    'outer: for r in 0..rounds {
+        for ep in eps.iter() {
+            match be.probe(ep) {
+                Ok(pi) => {
+                    info = Some(pi);
+                    break 'outer;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if r + 1 < rounds {
+            std::thread::sleep(cfg.retry_delay);
+        }
+    }
+    let info = match info {
+        Some(i) => i,
+        None => {
+            return Err(last_err.unwrap_or_else(|| retryable("probe", "探路失败：所有来源都不通")))
+        }
+    };
 
     for m in mirrors {
         if m.trim().is_empty() {

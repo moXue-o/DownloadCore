@@ -8,7 +8,11 @@ mod common;
 use common::{make_data, TestServer};
 use downloadcore::netclient::{NetClient, Target};
 use downloadcore::ErrorKind;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 fn client() -> NetClient {
@@ -139,4 +143,47 @@ fn idle_timeout_is_reported() {
         }
     }
     assert!(timed_out, "卡住时应报 TimedOut（已读 {total} 字节）");
+}
+
+/// 只接受**一条**连接、却在这条连接上服务两次请求：
+/// 若客户端复用了连接，两次请求都会成功；否则第二次会因无人 accept 而超时。
+#[test]
+fn keep_alive_reuses_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conns = Arc::new(AtomicUsize::new(0));
+    let c = conns.clone();
+    let body = b"hello keep-alive".to_vec();
+    let payload = body.clone();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        c.fetch_add(1, Ordering::SeqCst);
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        for _ in 0..2 {
+            // 读完一次请求头
+            loop {
+                let mut l = String::new();
+                let n = reader.read_line(&mut l).unwrap();
+                if n == 0 || l == "\r\n" {
+                    break;
+                }
+            }
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", payload.len());
+            let mut w = stream.try_clone().unwrap();
+            w.write_all(head.as_bytes()).unwrap();
+            w.write_all(&payload).unwrap();
+            w.flush().unwrap();
+        }
+    });
+
+    let client = NetClient::new("t", Duration::from_secs(3));
+    let url = format!("http://{addr}/f");
+    let a = read_all(client.open_plain(&Target::new(url.clone()), &[]).unwrap());
+    let b = read_all(client.open_plain(&Target::new(url), &[]).unwrap());
+
+    assert_eq!(a, body);
+    assert_eq!(b, body);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(conns.load(Ordering::SeqCst), 1, "应当复用同一条连接");
 }
