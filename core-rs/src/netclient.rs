@@ -31,8 +31,8 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
 const BAD_ADDR_COOLDOWN: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: usize = 500;
-/// 每个来源最多缓存多少条空闲长连接
-const POOL_MAX_IDLE: usize = 8;
+/// 每个来源最多缓存多少条空闲长连接（对齐最大并发，避免"用完就关、下次重连"）
+const POOL_MAX_IDLE: usize = 32;
 /// 空闲连接最长留多久
 const POOL_IDLE_MAX: Duration = Duration::from_secs(30);
 
@@ -186,7 +186,8 @@ impl NetClient {
             let loc = header_get(&hdrs, "location");
             if matches!(status, 301 | 302 | 303 | 307 | 308) && !loc.is_empty() {
                 let next = resolve(&u, loc);
-                drop(reader); // 跳转连接不回收，简单起见
+                // 跳转用的连接也回收：否则每个分段都要重新和"跳转服务器"握手
+                self.recycle_conn(reader, &key, &hdrs);
                 current = next;
                 continue;
             }
@@ -231,6 +232,25 @@ impl NetClient {
             }
         }
         Ok((BufReader::new(self.connect(u, pin)?), false))
+    }
+
+    /// 把一条（确认没有响应体的）连接放回池里复用。
+    fn recycle_conn(&self, reader: BufReader<Stream>, key: &str, hdrs: &[(String, String)]) {
+        if !wants_keep_alive(hdrs) {
+            return;
+        }
+        // 有响应体而我们没读 → 不能复用（否则下条响应会串味）
+        let te_chunked =
+            header_get(hdrs, "transfer-encoding").to_ascii_lowercase().contains("chunked");
+        let clen = header_get(hdrs, "content-length").trim().parse::<u64>().unwrap_or(0);
+        if te_chunked || clen > 0 || !reader.buffer().is_empty() {
+            return;
+        }
+        let mut m = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let v = m.entry(key.to_string()).or_default();
+        if v.len() < POOL_MAX_IDLE {
+            v.push(Pooled { reader, idle: Instant::now() });
+        }
     }
 
     fn connect(&self, u: &ParsedUrl, pin: Option<IpAddr>) -> Result<Stream> {
