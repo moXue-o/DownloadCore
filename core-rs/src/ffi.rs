@@ -69,6 +69,11 @@ fn error_code(e: &crate::errors::Error) -> c_int {
         "write" | "open" | "create" | "mkdir" | "assemble" | "rename" | "preallocate" | "seek" => {
             DC_ERR_IO
         }
+        "busy" => DC_ERR_BUSY,
+        // 网络层错误（既不是"参数无效"，也不是磁盘/内部错误）
+        "send" | "connect" | "tls" | "probe" | "response" | "read" | "range" | "whole"
+        | "redirect" => DC_ERR_HTTP,
+        // 真正的参数问题（如 URL 为空）
         "request" => DC_ERR_INVALID,
         _ => {
             if e.message.contains("builder error") || e.message.contains("invalid URL") {
@@ -364,6 +369,7 @@ pub unsafe extern "C" fn dc_engine_download(
     if err_msg.is_null() {
         return DC_ERR_INVALID;
     }
+    unsafe { *err_msg = std::ptr::null_mut() } // 成功时不返回错误信息，先置空免得宿主读到垃圾
     if !out.is_null() {
         unsafe {
             *out = dc_result {

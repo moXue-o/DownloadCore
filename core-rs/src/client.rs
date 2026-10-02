@@ -8,7 +8,7 @@
 //!   · 响应体走 channel **流式**转给阻塞读（去掉"每块 block_on"）；
 //!   · **记住跳转后的真实地址**，后面分段直接打过去（省掉每一跳）。
 
-use crate::backend::{host_of, port_of, Backend, Endpoint, ProbeInfo};
+use crate::backend::{host_of, port_of, redact_sensitive, same_origin, Backend, Endpoint, ProbeInfo};
 use crate::config::Config;
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
@@ -62,7 +62,16 @@ impl LtsBackend {
 
     fn client_for(&self, url: &str, ip: Option<IpAddr>) -> Result<reqwest::Client> {
         let host = host_of(url).unwrap_or_default();
-        let key = format!("{host}|{}", ip.map(|i| i.to_string()).unwrap_or_default());
+        let scheme = if url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+            "https"
+        } else {
+            "http"
+        };
+        let key = format!(
+            "{scheme}://{host}:{}|{}",
+            port_of(url),
+            ip.map(|i| i.to_string()).unwrap_or_default()
+        );
         if let Some(c) = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(c.clone());
         }
@@ -88,14 +97,14 @@ impl LtsBackend {
         Ok(client)
     }
 
-    fn cached_final(&self, url: &str) -> Option<String> {
+    fn cached_final(&self, key: &str) -> Option<String> {
         let m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
-        m.get(url)
+        m.get(key)
             .and_then(|(u, t)| if t.elapsed() < FINAL_URL_TTL { Some(u.clone()) } else { None })
     }
 
-    fn clear_final(&self, url: &str) {
-        self.final_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(url);
+    fn clear_final(&self, key: &str) {
+        self.final_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     }
 
     /// 发一次 GET（带可选 Range）。优先走上次跳转后的真实地址。
@@ -105,17 +114,21 @@ impl LtsBackend {
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<reqwest::Response> {
-        let cached = self.cached_final(&ep.url);
-        let (url, ip) = match &cached {
+        let ck = cache_key(&ep.url, ep.ip);
+        let cached = self.cached_final(&ck);
+        let (url, ip, send_headers) = match &cached {
             Some(f) if f.as_str() != ep.url => {
                 self.stat_final_hits.fetch_add(1, Ordering::Relaxed);
-                (f.clone(), None) // 用真实地址，不再 pin 原始主机
+                let same = same_origin(&ep.url, f);
+                // 跨域：别把 Authorization/Cookie 发到跳转后的主机；同源则保留原 IP 绑定
+                let hdrs = if same { headers.to_vec() } else { redact_sensitive(headers) };
+                let hop_ip = if same { ep.ip } else { None };
+                (f.clone(), hop_ip, hdrs)
             }
-            _ => (ep.url.clone(), ep.ip),
+            _ => (ep.url.clone(), ep.ip, headers.to_vec()),
         };
         let client = self.client_for(&url, ip)?;
         let ua = self.user_agent.clone();
-        let headers = headers.to_vec();
         let resp = self
             .rt
             .block_on(async move {
@@ -126,18 +139,18 @@ impl LtsBackend {
                 if let Some((a, b)) = range {
                     rb = rb.header("Range", format!("bytes={a}-{b}"));
                 }
-                for (k, v) in &headers {
+                for (k, v) in &send_headers {
                     rb = rb.header(k, v);
                 }
                 rb.send().await
             })
-            .map_err(|e| retryable("request", format!("{e}")))?;
+            .map_err(|e| retryable("send", format!("{e}")))?;
 
         // 记下"跳转后的真实地址"，供后续分段直接使用
         let final_url = resp.url().as_str();
         if final_url != ep.url {
             let mut m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
-            m.insert(ep.url.clone(), (final_url.to_string(), Instant::now()));
+            m.insert(ck, (final_url.to_string(), Instant::now()));
         }
         Ok(resp)
     }
@@ -166,6 +179,11 @@ impl LtsBackend {
     }
 }
 
+/// 跳转缓存键（含绑定的 IP，避免"多 IP 并行"被同一个跳转键覆盖）。
+fn cache_key(url: &str, ip: Option<IpAddr>) -> String {
+    format!("{url}|{}", ip.map(|i| i.to_string()).unwrap_or_default())
+}
+
 fn reqwest_to_io(e: reqwest::Error) -> io::Error {
     let kind = if e.is_timeout() { io::ErrorKind::TimedOut } else { io::ErrorKind::Other };
     io::Error::new(kind, e.to_string())
@@ -181,7 +199,11 @@ impl Backend for LtsBackend {
     }
 
     fn probe(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<ProbeInfo> {
-        let resp = self.get(ep, headers, Some((0, 0)))?;
+        let mut resp = self.get(ep, headers, Some((0, 0)))?;
+        if resp.status().as_u16() == 416 {
+            // 个别服务器对 "bytes=0-0" 回 416：退回不带 Range 再探一次
+            resp = self.get(ep, headers, None)?;
+        }
 
         let status = resp.status().as_u16();
         let etag = header_str(&resp, "etag");
@@ -206,7 +228,7 @@ impl Backend for LtsBackend {
             info.range_ok = false;
             info.size = clen;
         } else {
-            self.clear_final(&ep.url); // 缓存可能失效，下次重新解析
+            self.clear_final(&cache_key(&ep.url, ep.ip)); // 缓存可能失效，下次重新解析
             return Err(fatal("probe", format!("服务器返回状态 {status}")));
         }
         if accept_ranges.eq_ignore_ascii_case("none") {
@@ -226,7 +248,7 @@ impl Backend for LtsBackend {
 
         let status = resp.status().as_u16();
         if status != 206 {
-            self.clear_final(&ep.url);
+            self.clear_final(&cache_key(&ep.url, ep.ip));
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_str(&resp, "content-range");
@@ -245,7 +267,7 @@ impl Backend for LtsBackend {
         let resp = self.get(ep, headers, None)?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
-            self.clear_final(&ep.url);
+            self.clear_final(&cache_key(&ep.url, ep.ip));
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
         Ok(Box::new(self.body(resp)))
@@ -286,5 +308,65 @@ impl Read for LtsBody {
         out[..n].copy_from_slice(&self.buf[self.off..self.off + n]);
         self.off += n;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Callbacks, Config, Engine, Request};
+    use std::io::{BufRead, BufReader, Write};
+
+    /// 宿主若在异步运行时里调用，也不能 panic（LTS 后端内部用 block_on）。
+    #[test]
+    fn download_inside_tokio_context_does_not_panic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                if let Ok(mut s) = s {
+                    std::thread::spawn(move || {
+                        let mut r = BufReader::new(s.try_clone().unwrap());
+                        loop {
+                            let mut l = String::new();
+                            if r.read_line(&mut l).unwrap() == 0 || l == "\r\n" {
+                                break;
+                            }
+                        }
+                        let body = vec![7u8; 1 << 20];
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = s.write_all(&body);
+                    });
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("dlcore-async-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("o.bin");
+        let mut cfg = Config::default();
+        cfg.temp_dir = dir.join("t");
+        cfg.initial_threads = 1;
+        cfg.max_threads = 2;
+        let engine = Engine::new(cfg);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(async {
+            engine.download(
+                Request {
+                    url: format!("http://{addr}/f"),
+                    target_file: Some(out.display().to_string()),
+                    ..Default::default()
+                },
+                Callbacks::default(),
+            )
+        });
+        assert!(res.is_ok(), "异步上下文里调用不应 panic: {:?}", res.err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

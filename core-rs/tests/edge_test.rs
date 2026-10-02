@@ -7,6 +7,9 @@ mod common;
 use common::{make_data, unique_dir, TestServer};
 use downloadcore::{Callbacks, Config, Engine, Request};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 fn test_config(dir: &PathBuf) -> Config {
@@ -176,4 +179,147 @@ fn redirect_loop_is_rejected() {
     let err = download(&engine, &srv.url_redir(), &out, vec![]).unwrap_err();
     // 必须报错停下，绝不能无限打转
     assert!(!err.message.is_empty());
+}
+
+// ---------------- 安全：跨域跳转要剥掉敏感头 ----------------
+
+#[test]
+fn cross_origin_redirect_strips_sensitive_headers() {
+    let data = make_data(1 << 20, 10);
+    let target = TestServer::new(data.clone());
+    target.set_capture_header("authorization"); // 记录它有没有收到 Authorization
+    let redir = TestServer::new(data.clone()); // 另一台服务器 = 另一个源
+    redir.set_redirect(Some(target.url()));
+    let dir = unique_dir("xorigin-strip");
+    let out = dir.join("out.bin");
+    let engine = Engine::new(test_config(&dir));
+
+    let res = download(
+        &engine,
+        &redir.url_redir(),
+        &out,
+        vec![("Authorization".to_string(), "Bearer SECRET".to_string())],
+    )
+    .unwrap();
+    assert_eq!(read_file(&res.path), data);
+    assert_eq!(target.captured(), None, "跨域跳转后 Authorization 不应被转发");
+}
+
+#[test]
+fn same_origin_redirect_keeps_sensitive_headers() {
+    let data = make_data(1 << 20, 11);
+    let srv = TestServer::new(data.clone());
+    srv.set_capture_header("authorization");
+    srv.set_redirect(Some("/file.bin".to_string())); // 同源（同一台服务器）
+    let dir = unique_dir("sameorigin-keep");
+    let out = dir.join("out.bin");
+    let engine = Engine::new(test_config(&dir));
+
+    let res = download(
+        &engine,
+        &srv.url_redir(),
+        &out,
+        vec![("Authorization".to_string(), "Bearer KEEP".to_string())],
+    )
+    .unwrap();
+    assert_eq!(read_file(&res.path), data);
+    assert_eq!(srv.captured().as_deref(), Some("Bearer KEEP"), "同源跳转应保留 Authorization");
+}
+
+// ---------------- 防并发：同一个目标文件 ----------------
+
+#[test]
+fn concurrent_same_target_is_rejected() {
+    let data = make_data(4 << 20, 12);
+    let srv = TestServer::new(data);
+    srv.set_speed(512 << 10); // 慢一点，保证第一个还在下
+    let dir = unique_dir("concurrent");
+    let out = dir.join("out.bin");
+    let path = out.display().to_string();
+    let engine = Arc::new(Engine::new(test_config(&dir)));
+
+    let e2 = engine.clone();
+    let url = srv.url();
+    let p2 = path.clone();
+    let h = thread::spawn(move || {
+        let _ = e2.download(
+            Request { url, target_file: Some(p2), ..Default::default() },
+            Callbacks::default(),
+        );
+    });
+    thread::sleep(Duration::from_millis(300));
+    // 同一目标再来一次 → 必须被拒绝，不能两个一起写坏
+    let err = download(&engine, &srv.url(), &out, vec![]).unwrap_err();
+    assert!(err.message.contains("正在被另一个"), "错误应说明目标被占用: {}", err.message);
+    h.join().unwrap();
+}
+
+// ---------------- 续传：没有"身份证"就不硬接 ----------------
+
+#[test]
+fn resume_is_skipped_without_validators() {
+    let data = make_data(4 << 20, 13);
+    let srv = TestServer::new(data.clone());
+    srv.set_data(data.clone(), ""); // 清空 ETag → 服务器没有任何"身份证"
+    srv.set_speed(2 << 20);
+    let dir = unique_dir("novalid");
+    let out = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.max_retries = 0;
+    cfg.idle_timeout = Duration::from_secs(5);
+    let engine = Engine::new(cfg);
+
+    // 先下一半取消
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(400));
+        c2.store(true, Ordering::SeqCst);
+    });
+    let err = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                cancel: Some(cancel),
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, downloadcore::ErrorKind::Canceled);
+
+    // 恢复：没有身份证 → 应当"重新下载"，且结果正确
+    srv.set_speed(0);
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let lc = logs.clone();
+    let cbs = Callbacks {
+        on_log: Some(Box::new(move |e| lc.lock().unwrap().push(e.message))),
+        ..Default::default()
+    };
+    let res = engine
+        .download(
+            Request { url: srv.url(), target_file: Some(out.display().to_string()), ..Default::default() },
+            cbs,
+        )
+        .unwrap();
+    assert_eq!(read_file(&res.path), data);
+    let logged = logs.lock().unwrap().join("\n");
+    assert!(logged.contains("重新下载"), "无身份证时应当重新下载:\n{logged}");
+}
+
+// ---------------- 探路遇 416 要能退回 ----------------
+
+#[test]
+fn probe_416_falls_back_to_plain() {
+    let data = make_data(1 << 20, 14);
+    let srv = TestServer::new(data.clone());
+    srv.set_reject_range(true); // 对任何 Range 请求回 416
+    let dir = unique_dir("probe-416");
+    let out = dir.join("out.bin");
+    let engine = Engine::new(test_config(&dir));
+
+    let res = download(&engine, &srv.url(), &out, vec![]).unwrap();
+    assert!(!res.range_ok, "回退到整文件后应报不支持分段");
+    assert_eq!(read_file(&res.path), data);
 }

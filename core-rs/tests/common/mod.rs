@@ -24,6 +24,9 @@ struct Shared {
     redirect: Arc<Mutex<Option<String>>>,
     redirect_status: Arc<AtomicI64>,
     require_header: Arc<Mutex<Option<(String, String)>>>,
+    reject_range: Arc<AtomicBool>,
+    capture_name: Arc<Mutex<Option<String>>>,
+    captured: Arc<Mutex<Option<String>>>,
 }
 
 pub struct TestServer {
@@ -52,6 +55,9 @@ impl TestServer {
             redirect: Arc::new(Mutex::new(None)),
             redirect_status: Arc::new(AtomicI64::new(302)),
             require_header: Arc::new(Mutex::new(None)),
+            reject_range: Arc::new(AtomicBool::new(false)),
+            capture_name: Arc::new(Mutex::new(None)),
+            captured: Arc::new(Mutex::new(None)),
         };
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -121,6 +127,17 @@ impl TestServer {
         *self.shared.require_header.lock().unwrap() =
             Some((name.to_ascii_lowercase(), value.to_string()));
     }
+    /// 对任何带 Range 的请求回 416（测"探路遇 416 要能退回"）。
+    pub fn set_reject_range(&self, v: bool) {
+        self.shared.reject_range.store(v, Ordering::SeqCst);
+    }
+    /// 记录收到的某个请求头的值（测跨域跳转是否剥掉敏感头）。
+    pub fn set_capture_header(&self, name: &str) {
+        *self.shared.capture_name.lock().unwrap() = Some(name.to_ascii_lowercase());
+    }
+    pub fn captured(&self) -> Option<String> {
+        self.shared.captured.lock().unwrap().clone()
+    }
     pub fn hits(&self) -> usize {
         self.shared.hits.load(Ordering::SeqCst)
     }
@@ -154,6 +171,10 @@ fn handle_conn(mut stream: TcpStream, sh: Shared) -> std::io::Result<()> {
         }
     }
     let header = |name: &str| hdrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+
+    if let Some(name) = sh.capture_name.lock().unwrap().clone() {
+        *sh.captured.lock().unwrap() = header(&name);
+    }
 
     let mut range: Option<(i64, i64)> = None;
     if let Some(r) = header("range") {
@@ -192,6 +213,12 @@ fn handle_conn(mut stream: TcpStream, sh: Shared) -> std::io::Result<()> {
             stream.write_all(head.as_bytes())?;
             return Ok(());
         }
+    }
+
+    // 对任何带 Range 的请求回 416（探路应当能退回不带 Range）
+    if sh.reject_range.load(Ordering::SeqCst) && range.is_some() {
+        stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return Ok(());
     }
 
     if sh.no_range.load(Ordering::SeqCst) || range.is_none() {

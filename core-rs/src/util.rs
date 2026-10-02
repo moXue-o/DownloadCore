@@ -3,7 +3,8 @@ use std::path::Path;
 /// 解析 "bytes start-end/total"。
 pub fn parse_content_range(v: &str) -> Option<(i64, i64, i64)> {
     let v = v.trim();
-    if v.len() < 5 || !v[..5].eq_ignore_ascii_case("bytes") {
+    // 注意：不能直接 v[..5]（多字节字符会 panic），用 get 做边界安全比较
+    if !v.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("bytes")) {
         return None;
     }
     let rest = v[5..].trim();
@@ -155,6 +156,22 @@ pub fn write_all_at(f: &std::fs::File, buf: &[u8], mut offset: u64) -> std::io::
 /// 容错加锁：即使别的线程 panic 导致锁"中毒"，也取回内部数据，而不是跟着 panic。
 /// 用它替换裸 `Mutex`，可消除一大类 `unwrap` 崩溃点。
 pub struct Lock<T>(Mutex<T>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_range_is_boundary_safe() {
+        // 多字节字符跨越第 5 字节：不能 panic，只能返回 None
+        assert_eq!(parse_content_range("abcd€ 0-9/10"), None);
+        assert_eq!(parse_content_range(""), None);
+        assert_eq!(parse_content_range("bye"), None);
+        // 正常
+        assert_eq!(parse_content_range("bytes 0-9/10"), Some((0, 9, 10)));
+        assert_eq!(parse_content_range("bytes 5-5/*"), Some((5, 5, -1)));
+    }
+}
 
 impl<T> Lock<T> {
     pub fn new(v: T) -> Self {

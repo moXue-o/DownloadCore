@@ -7,7 +7,7 @@ use crate::split::split_to_range;
 use crate::store::{self, PartState, ResumeState, STATE_FILE_NAME};
 use crate::types::{Callbacks, DownloadResult, Progress, Request, Status};
 use crate::util::{filename_from_url, job_key, sanitize_name, Lock};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,33 @@ const SLOW_MIN_BYTES: i64 = 512 << 10;
 const SLOW_REMAINING_MIN: i64 = 64 << 10;
 /// 收尾阶段（活跃工人很少）允许把尾巴切到的最小粒度
 const TAIL_MIN: i64 = 128 << 10;
+
+/// 进程内"正在下载的目标文件"登记表：防止同一个目标被并发写坏。
+static ACTIVE_TARGETS: std::sync::OnceLock<Lock<HashSet<String>>> = std::sync::OnceLock::new();
+
+struct TargetGuard {
+    key: String,
+}
+
+impl Drop for TargetGuard {
+    fn drop(&mut self) {
+        if let Some(s) = ACTIVE_TARGETS.get() {
+            s.lock().remove(&self.key);
+        }
+    }
+}
+
+/// 认领一个目标文件；已被别的下载任务占用则返回 None。
+fn acquire_target(key: &str) -> Option<TargetGuard> {
+    let set = ACTIVE_TARGETS.get_or_init(|| Lock::new(HashSet::new()));
+    let mut g = set.lock();
+    if g.contains(key) {
+        None
+    } else {
+        g.insert(key.to_string());
+        Some(TargetGuard { key: key.to_string() })
+    }
+}
 const MAX_SLOW_RECONNECTS: usize = 8;
 // 绝对"卡死"线：低于它就重开（与整体快慢无关）
 const STUCK_RATE: f64 = 20.0 * 1024.0;
@@ -65,6 +92,17 @@ impl Engine {
         if req.url.is_empty() {
             return Err(fatal("request", "URL 为空"));
         }
+        // LTS 后端内部用 block_on / blocking_recv；若宿主自己在异步运行时里调用，
+        // 直接跑会 panic。检测到就换到独立线程执行（自研后端无此依赖）。
+        #[cfg(feature = "backend-lts")]
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::scope(|scope| {
+                match scope.spawn(|| self.run(req, cbs)).join() {
+                    Ok(r) => r,
+                    Err(_) => Err(fatal("internal", "下载线程 panic")),
+                }
+            });
+        }
         self.run(req, cbs)
     }
 
@@ -103,6 +141,17 @@ impl Engine {
         // 确定最终路径
         let (final_path, temp_dir) = self.setup_paths(&req, &pi)?;
         let marker = PathBuf::from(format!("{}{}", final_path.display(), self.cfg.incomplete_suffix));
+
+        // 防并发：同一个目标文件同时只允许一个下载任务写（否则两个任务会写坏同一个 .part）
+        let abs_key = target_key(&final_path);
+        let _target_guard = match acquire_target(&abs_key) {
+            Some(g) => g,
+            None => {
+                shared.logf("ERROR", "目标文件正在被另一个下载任务使用，已拒绝");
+                shared.status(Status::Failed);
+                return Err(fatal("busy", "目标文件正在被另一个下载任务使用"));
+            }
+        };
         shared.logf(
             "INFO",
             format!(
@@ -336,8 +385,7 @@ impl Engine {
                 PathBuf::from(dir).join(sanitize_name(&name))
             }
         };
-        let abs = std::path::absolute(&final_path).unwrap_or_else(|_| final_path.clone());
-        let key = job_key(&abs.display().to_string());
+        let key = target_key(&final_path);
         let temp_dir = self.cfg.temp_dir.join(key);
         if let Some(parent) = final_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -358,14 +406,20 @@ impl Engine {
         fs::create_dir_all(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
 
         if let Some(st) = store::load_state_file(&temp_dir.join(STATE_FILE_NAME)) {
-            if st.version == 1
+            let has_validator = !pi.etag.is_empty() || !pi.last_modified.is_empty();
+            let matches = st.version == 1
                 && st.url == shared.url()
                 && st.total == pi.size
                 && st.etag == pi.etag
                 && st.last_modified == pi.last_modified
                 && !st.parts.is_empty()
-                && marker.exists()
-            {
+                && marker.exists();
+            if matches && !has_validator {
+                shared.logf(
+                    "WARN",
+                    "服务器未提供 ETag/Last-Modified，无法确认文件未变；为安全起见重新下载",
+                );
+            } else if matches {
                 let mut parts = shared.parts.lock();
                 let mut queue = shared.queue.lock();
                 for ps in &st.parts {
@@ -445,7 +499,7 @@ impl Engine {
 
     fn download_whole_once(&self, shared: &Arc<Shared>, marker: &Path) -> Result<()> {
         let (be, ep, src_idx) = shared.pick_source();
-        let headers = shared.headers();
+        let headers = shared.headers_for(&ep.url);
         let mut body = be.open_plain(&ep, &headers)?;
         let mut file = File::create(marker).map_err(|e| fatal("create", format!("创建文件失败: {e}")))?;
         shared.downloaded.store(0, Ordering::SeqCst);
@@ -585,6 +639,16 @@ impl Shared {
         self.headers.get().cloned().unwrap_or_default()
     }
 
+    /// 取"给某个来源用的请求头"：跨域来源要剥掉敏感头（Authorization/Cookie 等）。
+    fn headers_for(&self, url: &str) -> Vec<(String, String)> {
+        let h = self.headers();
+        if crate::backend::same_origin(&self.url(), url) {
+            h
+        } else {
+            crate::backend::redact_sensitive(&h)
+        }
+    }
+
     fn status(&self, s: Status) {
         if let Some(cb) = &self.cbs.on_status {
             cb(s);
@@ -654,8 +718,17 @@ fn speed_of(bytes: i64, elapsed: Duration) -> i64 {
 }
 
 fn move_into_place(src: &Path, final_path: &Path) -> Result<()> {
-    let _ = fs::remove_file(final_path);
+    // 直接改名（覆盖已存在的目标）。不要"先删后改"——那样中途失败会把旧文件也搞没。
     fs::rename(src, final_path).map_err(|e| fatal("rename", format!("改名失败: {e}")))
+}
+
+/// 把最终路径归一化成稳定 key：Windows 大小写不敏感 → 统一小写，
+/// 避免同一个文件因大小写不同被当成两个（并发写坏 / 临时目录分裂）。
+fn target_key(path: &Path) -> String {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = abs.display().to_string();
+    let s = if cfg!(windows) { s.to_lowercase() } else { s };
+    job_key(&s)
 }
 
 /// 从所有段里挑"剩下活最多"的那段来分裂。
@@ -706,19 +779,42 @@ fn spawn_part(
     s.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
     s.running.fetch_add(1, Ordering::SeqCst);
     let handle = thread::spawn(move || {
-        let res = run_part(&s, &l, &cfg, &dir, &part);
-        s.running.fetch_sub(1, Ordering::SeqCst);
+        // 计数守卫：无论正常结束还是 panic，都保证把 running 减回去（否则主循环会永久挂死）
+        struct RunningGuard(Arc<Shared>);
+        impl Drop for RunningGuard {
+            fn drop(&mut self) {
+                self.0.running.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _running = RunningGuard(s.clone());
+        // panic 不能穿透到"没人接"的地方：捕获后当普通错误处理
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_part(&s, &l, &cfg, &dir, &part)
+        }));
         match res {
-            Ok(()) => s.logf("DEBUG", format!("工人结束（完成）：段 [{from}, {to}]")),
-            Err(e) if e.kind == ErrorKind::Canceled => {}
-            Err(e) => {
-                s.logf("WARN", format!("工人结束（出错）：段 [{from}, {to}]，错误={e}"));
-                let mut fe = s.first_err.lock();
-                if fe.is_none() {
-                    *fe = Some(e);
+            Ok(Ok(())) => s.logf("DEBUG", format!("工人结束（完成）：段 [{from}, {to}]")),
+            Ok(Err(e)) if e.kind == ErrorKind::Canceled => {}
+            Ok(Err(e)) => {
+                // 先把"失败+取消"落实，再打日志：万一宿主的日志回调 panic，也不会丢错误状态
+                let msg = format!("工人结束（出错）：段 [{from}, {to}]，错误={e}");
+                {
+                    let mut fe = s.first_err.lock();
+                    if fe.is_none() {
+                        *fe = Some(e);
+                    }
                 }
-                drop(fe);
                 s.cancel.store(true, Ordering::SeqCst);
+                s.logf("WARN", msg);
+            }
+            Err(_) => {
+                {
+                    let mut fe = s.first_err.lock();
+                    if fe.is_none() {
+                        *fe = Some(fatal("internal", "下载线程 panic"));
+                    }
+                }
+                s.cancel.store(true, Ordering::SeqCst);
+                s.logf("ERROR", format!("工人 panic（已捕获）：段 [{from}, {to}]"));
             }
         }
     });
@@ -787,7 +883,7 @@ fn download_part_once(
         }
         // 每次（重）连接都轮换一个来源：多 IP / 镜像之间轮转
         let (be, ep, src_idx) = shared.pick_source();
-        let headers = shared.headers();
+        let headers = shared.headers_for(&ep.url);
         let body = match be.open_range(&ep, &headers, current, to) {
             Ok(b) => b,
             Err(e) => {

@@ -53,6 +53,33 @@ pub trait Backend: Send + Sync {
     }
 }
 
+/// 某个请求头是不是"敏感"的（跨域跳转时要丢掉，别把凭据发到别的主机）。
+pub fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "proxy-authorization"
+    )
+}
+
+/// 去掉所有敏感头（用于跨域跳转）。
+pub fn redact_sensitive(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers.iter().filter(|(k, _)| !is_sensitive_header(k)).cloned().collect()
+}
+
+fn origin_of(url: &str) -> Option<(String, u16, String)> {
+    let (scheme, _) = url.trim().split_once("://")?;
+    let host = host_of(url)?;
+    Some((scheme.to_ascii_lowercase(), port_of(url), host))
+}
+
+/// 两个网址是否同源（scheme + host + port）。解析不出来就当作"不同源"，宁可从严。
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (origin_of(a), origin_of(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// 从网址里取主机名（去掉协议、userinfo、端口、路径、查询、锚点）。
 pub fn host_of(url: &str) -> Option<String> {
     let (_, rest) = url.split_once("://")?;
@@ -70,7 +97,7 @@ pub fn host_of(url: &str) -> Option<String> {
 
 /// 网址的端口（默认 http=80 / https=443）。
 pub fn port_of(url: &str) -> u16 {
-    let default = if url.starts_with("https://") { 443 } else { 80 };
+    let default = if url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) { 443 } else { 80 };
     let Some((_, rest)) = url.split_once("://") else { return default };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let authority = authority.rsplit('@').next().unwrap_or(authority);
@@ -116,15 +143,19 @@ fn sources_for(cfg: &Config, url: &str) -> Vec<Endpoint> {
     vec![Endpoint { url: url.to_string(), ip: None, label: "default".to_string() }]
 }
 
-/// 两个来源算不算"同一个文件"：大小一致、ETag 一致（都为空也算）、分段支持一致。
+/// 两个来源算不算"同一个文件"：大小、分段支持一致，且**至少有一个身份证（ETag 或
+/// Last-Modified）非空并相等**。没有身份证就只比大小太危险（同大小不同内容会拼坏文件）。
 fn same_file(a: &ProbeInfo, b: &ProbeInfo) -> bool {
     if a.size != b.size || a.range_ok != b.range_ok {
         return false;
     }
-    if !a.etag.is_empty() && !b.etag.is_empty() && a.etag != b.etag {
-        return false;
+    if !a.etag.is_empty() && !b.etag.is_empty() {
+        return a.etag == b.etag;
     }
-    true
+    if !a.last_modified.is_empty() && !b.last_modified.is_empty() {
+        return a.last_modified == b.last_modified;
+    }
+    false
 }
 
 /// 建来源池并探路。镜像只有"与主源是同一文件"才被采纳。
@@ -169,8 +200,13 @@ pub fn build_pool(
             continue;
         }
         // 先用单个来源探路，确认是同一文件再纳入（并展开多 IP）
+        let m_headers: Vec<(String, String)> = if same_origin(primary, m) {
+            headers.to_vec()
+        } else {
+            redact_sensitive(headers) // 跨域镜像：别把 Authorization/Cookie 发过去
+        };
         let tmp = sources_for(cfg, m);
-        match be.probe(&tmp[0], headers) {
+        match be.probe(&tmp[0], &m_headers) {
             Ok(pi) if same_file(&info, &pi) => eps.extend(tmp),
             _ => {}
         }

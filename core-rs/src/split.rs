@@ -9,8 +9,8 @@ pub fn split_to_range(size: i64, min_part_size: i64, max_part_count: usize) -> V
     let min_part_size = min_part_size.max(1);
     let max_part_count = max_part_count.max(1) as i64;
 
-    // 至少能切出多少个"最小块"
-    let min_parts = (size + min_part_size - 1) / min_part_size;
+    // 至少能切出多少个"最小块"（saturating 防服务器谎报超大 size 时溢出）
+    let min_parts = size.saturating_add(min_part_size - 1) / min_part_size;
     let actual = max_part_count.min(min_parts.max(1));
 
     let ideal = size / actual;

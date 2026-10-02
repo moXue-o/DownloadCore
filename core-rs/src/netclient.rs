@@ -15,7 +15,7 @@
 //!
 //! 这里只负责"把 HTTP 说明白"；分段、续传、看门狗、写文件等仍由引擎负责。
 
-use crate::backend::{Backend, Endpoint};
+use crate::backend::{redact_sensitive, same_origin, Backend, Endpoint};
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
 use std::collections::HashMap;
@@ -30,6 +30,8 @@ const MAX_REDIRECTS: usize = 10;
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
 /// 并发起跑（happy eyeballs）时，相邻地址之间的起跑间隔。
 const CONNECT_STAGGER_MS: u64 = 200;
+/// 单次连接最多并发尝试几个地址（防止起一堆线程）。
+const MAX_CONNECT_ADDRS: usize = 4;
 /// 某个地址连接失败后，进"冷宫"多久（期间不再优先尝试它）。
 const BAD_ADDR_COOLDOWN: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -110,7 +112,14 @@ impl NetClient {
 
     /// 探路。注意：会真的发一个 `Range: bytes=0-0` 的 GET。
     pub fn probe(&self, t: &Target, headers: &[(String, String)]) -> Result<ProbeInfo> {
-        let (status, hdrs, _body) = self.request(&t.url, t.ip, headers, Some((0, 0)))?;
+        let (mut status, mut hdrs, _body) = self.request(&t.url, t.ip, headers, Some((0, 0)))?;
+        if status == 416 {
+            // 个别服务器对 "bytes=0-0" 回 416：退回不带 Range 再探一次
+            let (s2, h2, b2) = self.request(&t.url, t.ip, headers, None)?;
+            status = s2;
+            hdrs = h2;
+            drop(b2);
+        }
 
         let etag = header_get(&hdrs, "etag").to_string();
         let last_modified = header_get(&hdrs, "last-modified").to_string();
@@ -133,6 +142,7 @@ impl NetClient {
             info.range_ok = false;
             info.size = clen;
         } else {
+            self.clear_final(&cache_key(&t.url, t.ip));
             return Err(fatal("probe", format!("服务器返回状态 {status}")));
         }
         if accept_ranges.eq_ignore_ascii_case("none") {
@@ -151,6 +161,8 @@ impl NetClient {
     ) -> Result<Body> {
         let (status, hdrs, body) = self.request(&t.url, t.ip, headers, Some((from, to)))?;
         if status != 206 {
+            // 缓存的真实地址若失效（过期签名页可能回 200），清掉让下次重新解析
+            self.clear_final(&cache_key(&t.url, t.ip));
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_get(&hdrs, "content-range");
@@ -169,6 +181,7 @@ impl NetClient {
     pub fn open_plain(&self, t: &Target, headers: &[(String, String)]) -> Result<Body> {
         let (status, _hdrs, body) = self.request(&t.url, t.ip, headers, None)?;
         if !(200..300).contains(&status) {
+            self.clear_final(&cache_key(&t.url, t.ip));
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
         Ok(body)
@@ -183,33 +196,46 @@ impl NetClient {
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<(u16, Vec<(String, String)>, Body)> {
-        if let Some(final_url) = self.cached_final(url) {
+        let ck = cache_key(url, pin);
+        if let Some(final_url) = self.cached_final(&ck) {
             if final_url != url {
                 self.stat_final_hits.fetch_add(1, Ordering::Relaxed);
-                if let Ok((status, hdrs, body, _)) =
-                    self.request_follow(&final_url, None, headers, range)
+                let same = same_origin(url, &final_url);
+                let hop_pin = if same { pin } else { None };
+                // 跨域：别把 Authorization/Cookie 发到跳转后的主机
+                let hdrs: Vec<(String, String)> =
+                    if same { headers.to_vec() } else { redact_sensitive(headers) };
+                if let Ok((status, hdrs_r, body, _)) =
+                    self.request_follow(&final_url, hop_pin, &hdrs, range)
                 {
                     if (200..400).contains(&status) {
-                        return Ok((status, hdrs, body));
+                        return Ok((status, hdrs_r, body));
                     }
                 }
                 // 缓存失效（签名过期等）：清掉，回退原始地址重新跳转
-                self.final_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(url);
+                self.clear_final(&ck);
             }
         }
         let (status, hdrs, body, final_url) = self.request_follow(url, pin, headers, range)?;
         if final_url != url {
-            let mut m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
-            m.insert(url.to_string(), (final_url, Instant::now()));
+            self.final_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(ck, (final_url, Instant::now()));
         }
         Ok((status, hdrs, body))
     }
 
     /// 取一条仍然新鲜的"真实地址"缓存。
-    fn cached_final(&self, url: &str) -> Option<String> {
+    fn cached_final(&self, key: &str) -> Option<String> {
         let m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
-        m.get(url)
+        m.get(key)
             .and_then(|(u, t)| if t.elapsed() < FINAL_URL_TTL { Some(u.clone()) } else { None })
+    }
+
+    /// 清掉"跳转后真实地址"缓存（缓存地址失效时用）。
+    fn clear_final(&self, key: &str) {
+        self.final_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     }
 
     /// 跟随跳转发送请求；返回最终地址。
@@ -220,16 +246,22 @@ impl NetClient {
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<(u16, Vec<(String, String)>, Body, String)> {
+        // 原始地址（用于判断"是否跨域"）：跨域就剥敏感头、也别再绑原主机的 IP
+        let base = parse_url(url)?;
+        let redacted = redact_sensitive(headers);
         let mut current = url.to_string();
         for _ in 0..=MAX_REDIRECTS {
             let u = parse_url(&current)?;
-            let key = conn_key(&u, pin);
+            let same = u.https == base.https && u.host == base.host && u.port == base.port;
+            let hop_pin = if same { pin } else { None };
+            let send_headers: &[(String, String)] = if same { headers } else { &redacted };
+            let key = conn_key(&u, hop_pin);
 
             // 复用连接可能已被对端关掉：失败一次就换新连接重试（最多两次）
             let mut got = None;
             for attempt in 0..2 {
-                let (mut reader, reused) = self.take_conn(&key, &u, pin)?;
-                match self.exchange(&mut reader, &u, headers, range) {
+                let (mut reader, reused) = self.take_conn(&key, &u, hop_pin)?;
+                match self.exchange(&mut reader, &u, send_headers, range) {
                     Ok((status, hdrs)) => {
                         got = Some((reader, status, hdrs));
                         break;
@@ -274,8 +306,8 @@ impl NetClient {
         reader
             .get_mut()
             .write_all(req.as_bytes())
-            .map_err(|e| map_io("request", e))?;
-        reader.get_mut().flush().map_err(|e| map_io("request", e))?;
+            .map_err(|e| map_io("send", e))?;
+        reader.get_mut().flush().map_err(|e| map_io("send", e))?;
         let status = read_status_line(reader)?;
         let hdrs = read_headers(reader)?;
         Ok((status, hdrs))
@@ -335,11 +367,13 @@ impl NetClient {
         if cands.is_empty() {
             return Err(fatal("connect", format!("找不到主机 {}", u.host)));
         }
+        cands.truncate(MAX_CONNECT_ADDRS); // 别为了一个连接起一堆线程
 
         // 把"冷宫"里的地址排到最后；若全在冷宫，则照常逐个尝试（限期已过或都坏）
         let now = Instant::now();
         let ordered: Vec<IpAddr> = {
-            let bad = self.bad.lock().unwrap_or_else(|e| e.into_inner());
+            let mut bad = self.bad.lock().unwrap_or_else(|e| e.into_inner());
+            bad.retain(|_, t| now.duration_since(*t) < BAD_ADDR_COOLDOWN); // 顺手清理过期项
             let is_bad = |ip: &IpAddr| {
                 bad.get(ip).map(|t| now.duration_since(*t) < BAD_ADDR_COOLDOWN).unwrap_or(false)
             };
@@ -594,11 +628,35 @@ fn read_mode(inner: &mut BufReader<Stream>, mode: &mut Mode, buf: &mut [u8]) -> 
 
 // ---------------- 报文读写 ----------------
 
+/// 单行响应头上限，防坏服务器用"永不换行的超长行"把内存撑爆
+const MAX_LINE_BYTES: usize = 64 * 1024;
+/// 响应头总字节上限
+const MAX_HEADER_BYTES: usize = 1024 * 1024;
+
 fn read_line<R: BufRead>(r: &mut R) -> io::Result<String> {
     let mut raw: Vec<u8> = Vec::new();
-    let n = r.read_until(b'\n', &mut raw)?;
-    if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "连接提前关闭"));
+    loop {
+        let available = match r.fill_buf() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            if raw.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "连接提前关闭"));
+            }
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            raw.extend_from_slice(&available[..=pos]);
+            r.consume(pos + 1);
+            break;
+        }
+        let n = available.len();
+        raw.extend_from_slice(available);
+        r.consume(n);
+        if raw.len() > MAX_LINE_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "响应行过长"));
+        }
     }
     while matches!(raw.last().copied(), Some(b'\n') | Some(b'\r')) {
         raw.pop();
@@ -614,13 +672,15 @@ fn read_status_line<R: BufRead>(r: &mut R) -> Result<u16> {
 
 fn read_headers<R: BufRead>(r: &mut R) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
+    let mut total = 0usize;
     loop {
         let line = read_line(r).map_err(|e| map_io("response", e))?;
         if line.is_empty() {
             break;
         }
-        if out.len() >= MAX_HEADERS {
-            return Err(fatal("response", "响应头过多"));
+        total += line.len() + 2;
+        if out.len() >= MAX_HEADERS || total > MAX_HEADER_BYTES {
+            return Err(fatal("response", "响应头过多/过大"));
         }
         if let Some(i) = line.find(':') {
             let name = line[..i].trim().to_ascii_lowercase();
@@ -645,7 +705,18 @@ fn wants_keep_alive(headers: &[(String, String)]) -> bool {
 }
 
 fn conn_key(u: &ParsedUrl, pin: Option<IpAddr>) -> String {
-    format!("{}:{}|{}", u.host, u.port, pin.map(|i| i.to_string()).unwrap_or_default())
+    format!(
+        "{}://{}:{}|{}",
+        if u.https { "https" } else { "http" },
+        u.host,
+        u.port,
+        pin.map(|i| i.to_string()).unwrap_or_default()
+    )
+}
+
+/// 跳转缓存键：同一个 URL 绑不同 IP 要分开记（否则"多 IP 并行"会被一个跳转键覆盖掉）。
+fn cache_key(url: &str, ip: Option<IpAddr>) -> String {
+    format!("{url}|{}", ip.map(|i| i.to_string()).unwrap_or_default())
 }
 
 fn build_request(
@@ -674,6 +745,10 @@ fn build_request(
             || k.eq_ignore_ascii_case("range")
             || k.eq_ignore_ascii_case("connection")
         {
+            continue;
+        }
+        // 拒绝含 CR/LF 的头（防请求头注入）
+        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
             continue;
         }
         s.push_str(&format!("{k}: {v}\r\n"));
