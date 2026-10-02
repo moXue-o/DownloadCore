@@ -180,8 +180,8 @@ impl Backend for LtsBackend {
         "lts"
     }
 
-    fn probe(&self, ep: &Endpoint) -> Result<ProbeInfo> {
-        let resp = self.get(ep, &[], Some((0, 0)))?;
+    fn probe(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<ProbeInfo> {
+        let resp = self.get(ep, headers, Some((0, 0)))?;
 
         let status = resp.status().as_u16();
         let etag = header_str(&resp, "etag");

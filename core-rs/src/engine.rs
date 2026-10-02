@@ -76,7 +76,7 @@ impl Engine {
 
         shared.status(Status::Probing);
         // 建来源池（主地址 + 镜像/多 IP）并探路
-        let (eps, pi) = match build_pool(self.backend.as_ref(), &self.cfg, &req.url, &req.mirrors) {
+        let (eps, pi) = match build_pool(self.backend.as_ref(), &self.cfg, &req.url, &req.mirrors, &req.headers) {
             Ok(x) => x,
             Err(e) => {
                 shared.status(Status::Failed);

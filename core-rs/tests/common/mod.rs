@@ -22,6 +22,8 @@ struct Shared {
     forced_status: Arc<AtomicI64>,
     chunked: Arc<AtomicBool>,
     redirect: Arc<Mutex<Option<String>>>,
+    redirect_status: Arc<AtomicI64>,
+    require_header: Arc<Mutex<Option<(String, String)>>>,
 }
 
 pub struct TestServer {
@@ -48,6 +50,8 @@ impl TestServer {
             forced_status: Arc::new(AtomicI64::new(0)),
             chunked: Arc::new(AtomicBool::new(false)),
             redirect: Arc::new(Mutex::new(None)),
+            redirect_status: Arc::new(AtomicI64::new(302)),
+            require_header: Arc::new(Mutex::new(None)),
         };
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -75,6 +79,10 @@ impl TestServer {
 
     pub fn url(&self) -> String {
         format!("http://{}/file.bin", self.addr)
+    }
+    /// 专门的"跳转入口"地址：只有这个路径才会触发 302。
+    pub fn url_redir(&self) -> String {
+        format!("http://{}/redir", self.addr)
     }
     pub fn set_data(&self, d: Vec<u8>, etag: &str) {
         *self.shared.data.lock().unwrap() = d;
@@ -104,6 +112,15 @@ impl TestServer {
     pub fn set_redirect(&self, location: Option<String>) {
         *self.shared.redirect.lock().unwrap() = location;
     }
+    /// 指定跳转用的状态码（默认 302）。
+    pub fn set_redirect_status(&self, code: u16) {
+        self.shared.redirect_status.store(code as i64, Ordering::SeqCst);
+    }
+    /// 要求请求必须带某个头（否则 403）。用于测 Cookie/鉴权等。
+    pub fn set_require_header(&self, name: &str, value: &str) {
+        *self.shared.require_header.lock().unwrap() =
+            Some((name.to_ascii_lowercase(), value.to_string()));
+    }
     pub fn hits(&self) -> usize {
         self.shared.hits.load(Ordering::SeqCst)
     }
@@ -124,17 +141,31 @@ fn handle_conn(mut stream: TcpStream, sh: Shared) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let mut range: Option<(i64, i64)> = None;
+    let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+    let mut hdrs: Vec<(String, String)> = Vec::new();
     loop {
         let mut h = String::new();
         let n = reader.read_line(&mut h)?;
         if n == 0 || h == "\r\n" || h == "\n" {
             break;
         }
-        let lower = h.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("range:") {
-            let size = sh.data.lock().unwrap().len() as i64;
-            range = parse_range(rest.trim(), size);
+        if let Some(i) = h.find(':') {
+            hdrs.push((h[..i].trim().to_ascii_lowercase(), h[i + 1..].trim().to_string()));
+        }
+    }
+    let header = |name: &str| hdrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+
+    let mut range: Option<(i64, i64)> = None;
+    if let Some(r) = header("range") {
+        let size = sh.data.lock().unwrap().len() as i64;
+        range = parse_range(r.trim(), size);
+    }
+
+    // 需要某个头（Cookie/鉴权），否则 403
+    if let Some((k, v)) = sh.require_header.lock().unwrap().clone() {
+        if header(&k).as_deref() != Some(v.as_str()) {
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            return Ok(());
         }
     }
 
@@ -152,12 +183,15 @@ fn handle_conn(mut stream: TcpStream, sh: Shared) -> std::io::Result<()> {
         return Ok(());
     }
 
-    if let Some(loc) = sh.redirect.lock().unwrap().clone() {
-        let head = format!(
-            "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(head.as_bytes())?;
-        return Ok(());
+    if path.starts_with("/redir") {
+        if let Some(loc) = sh.redirect.lock().unwrap().clone() {
+            let code = sh.redirect_status.load(Ordering::SeqCst);
+            let head = format!(
+                "HTTP/1.1 {code} Redirect\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes())?;
+            return Ok(());
+        }
     }
 
     if sh.no_range.load(Ordering::SeqCst) || range.is_none() {

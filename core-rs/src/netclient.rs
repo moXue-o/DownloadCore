@@ -789,8 +789,8 @@ impl Backend for NetClient {
         "native"
     }
 
-    fn probe(&self, ep: &Endpoint) -> Result<ProbeInfo> {
-        NetClient::probe(self, &to_target(ep), &[])
+    fn probe(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<ProbeInfo> {
+        NetClient::probe(self, &to_target(ep), headers)
     }
 
     fn open_range(

@@ -35,8 +35,8 @@ pub struct Endpoint {
 pub trait Backend: Send + Sync {
     /// 后端名字，日志用。
     fn name(&self) -> &'static str;
-    /// 探路：文件多大、能不能分段、ETag 等。
-    fn probe(&self, ep: &Endpoint) -> Result<ProbeInfo>;
+    /// 探路：文件多大、能不能分段、ETag 等。带上传入的额外请求头（Cookie/鉴权等）。
+    fn probe(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<ProbeInfo>;
     /// 打开某一段的字节流（内部需"对暗号"，起点必须一致）。
     fn open_range(
         &self,
@@ -136,6 +136,7 @@ pub fn build_pool(
     cfg: &Config,
     primary: &str,
     mirrors: &[String],
+    headers: &[(String, String)],
 ) -> Result<(Vec<Endpoint>, ProbeInfo)> {
     let mut eps = sources_for(cfg, primary);
 
@@ -144,7 +145,7 @@ pub fn build_pool(
     let mut last_err = None;
     'outer: for r in 0..rounds {
         for ep in eps.iter() {
-            match be.probe(ep) {
+            match be.probe(ep, headers) {
                 Ok(pi) => {
                     info = Some(pi);
                     break 'outer;
@@ -169,7 +170,7 @@ pub fn build_pool(
         }
         // 先用单个来源探路，确认是同一文件再纳入（并展开多 IP）
         let tmp = sources_for(cfg, m);
-        match be.probe(&tmp[0]) {
+        match be.probe(&tmp[0], headers) {
             Ok(pi) if same_file(&info, &pi) => eps.extend(tmp),
             _ => {}
         }

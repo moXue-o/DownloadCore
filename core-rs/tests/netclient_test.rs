@@ -117,7 +117,7 @@ fn redirect_is_followed() {
     let redirector = TestServer::new(make_data(1 << 10, 10));
     redirector.set_redirect(Some(target.url()));
 
-    let info = client().probe(&Target::new(redirector.url()), &[]).unwrap();
+    let info = client().probe(&Target::new(redirector.url_redir()), &[]).unwrap();
     assert_eq!(info.size, data.len() as i64, "应当跟随 302 到真正的目标");
     assert!(target.hits() > 0, "目标服务器应当被访问到");
 }
