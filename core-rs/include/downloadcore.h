@@ -84,7 +84,7 @@ typedef struct dc_config {
     const char* incomplete_suffix; /* 未完成后缀；NULL/空 用默认 */
     const char* user_agent;     /* NULL/空 用默认 */
     uint64_t max_speed;         /* 全局限速（字节/秒），0 不限 */
-    int      adaptive_threads;  /* 1=并发在 initial..max 之间自动找最优（默认） */
+    int      adaptive_threads;  /* 1=并发在 initial..max 之间自动爬坡（默认 0=固定并发） */
     int      use_multiple_ips;  /* 1=域名解析成多个 IP 并行（默认） */
 } dc_config;
 

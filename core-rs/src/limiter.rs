@@ -38,8 +38,10 @@ impl Limiter {
             let elapsed = now.duration_since(g.last).as_secs_f64();
             g.last = now;
             g.tokens += self.max_speed as f64 * elapsed;
-            if g.tokens > self.burst {
-                g.tokens = self.burst;
+            // 单次请求可能超过 burst（比如缓冲调很大）：桶上限至少放到 n，否则永远满足不了
+            let cap = self.burst.max(n);
+            if g.tokens > cap {
+                g.tokens = cap;
             }
             if g.tokens >= n {
                 g.tokens -= n;

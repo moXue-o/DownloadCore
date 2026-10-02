@@ -25,6 +25,7 @@ struct Shared {
     redirect_status: Arc<AtomicI64>,
     require_header: Arc<Mutex<Option<(String, String)>>>,
     reject_range: Arc<AtomicBool>,
+    reject_if_range: Arc<AtomicBool>,
     capture_name: Arc<Mutex<Option<String>>>,
     captured: Arc<Mutex<Option<String>>>,
 }
@@ -56,6 +57,7 @@ impl TestServer {
             redirect_status: Arc::new(AtomicI64::new(302)),
             require_header: Arc::new(Mutex::new(None)),
             reject_range: Arc::new(AtomicBool::new(false)),
+            reject_if_range: Arc::new(AtomicBool::new(false)),
             capture_name: Arc::new(Mutex::new(None)),
             captured: Arc::new(Mutex::new(None)),
         };
@@ -131,6 +133,10 @@ impl TestServer {
     pub fn set_reject_range(&self, v: bool) {
         self.shared.reject_range.store(v, Ordering::SeqCst);
     }
+    /// 带 If-Range 的请求一律回 200（模拟"内容已变，验证器不匹配"）。
+    pub fn set_reject_if_range(&self, v: bool) {
+        self.shared.reject_if_range.store(v, Ordering::SeqCst);
+    }
     /// 记录收到的某个请求头的值（测跨域跳转是否剥掉敏感头）。
     pub fn set_capture_header(&self, name: &str) {
         *self.shared.capture_name.lock().unwrap() = Some(name.to_ascii_lowercase());
@@ -180,6 +186,11 @@ fn handle_conn(mut stream: TcpStream, sh: Shared) -> std::io::Result<()> {
     if let Some(r) = header("range") {
         let size = sh.data.lock().unwrap().len() as i64;
         range = parse_range(r.trim(), size);
+    }
+
+    // 模拟"验证器不匹配"：带 If-Range 的请求回 200（整文件）→ 客户端必须据此报错
+    if sh.reject_if_range.load(Ordering::SeqCst) && header("if-range").is_some() {
+        range = None;
     }
 
     // 需要某个头（Cookie/鉴权），否则 403

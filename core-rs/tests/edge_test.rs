@@ -323,3 +323,22 @@ fn probe_416_falls_back_to_plain() {
     assert!(!res.range_ok, "回退到整文件后应报不支持分段");
     assert_eq!(read_file(&res.path), data);
 }
+
+// ---------------- 内容变了（If-Range 不匹配）必须干净失败 ----------------
+
+#[test]
+fn if_range_mismatch_fails_loudly() {
+    let data = make_data(2 << 20, 15);
+    let srv = TestServer::new(data);
+    srv.set_reject_if_range(true); // 带 If-Range 的请求一律回 200 = "验证器不匹配"
+    let dir = unique_dir("ifrange");
+    let out = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.max_retries = 1;
+    let engine = Engine::new(cfg);
+
+    // 必须干净失败：绝不把"拼错的字节"当成功产出正式文件
+    let err = download(&engine, &srv.url(), &out, vec![]).unwrap_err();
+    assert!(!err.message.is_empty());
+    assert!(!out.exists(), "失败时不应留下正式文件");
+}

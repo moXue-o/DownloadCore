@@ -78,6 +78,10 @@ impl Config {
         if self.retry_delay.is_zero() {
             self.retry_delay = Duration::from_secs(1);
         }
+        // 读超时为 0 会让 set_read_timeout 静默失败 → 卡死；拉回默认
+        if self.idle_timeout.is_zero() {
+            self.idle_timeout = Duration::from_secs(15);
+        }
         if self.temp_dir.as_os_str().is_empty() {
             self.temp_dir = std::env::temp_dir().join("downloadcore");
         }

@@ -56,8 +56,8 @@ pub trait Backend: Send + Sync {
 /// 某个请求头是不是"敏感"的（跨域跳转时要丢掉，别把凭据发到别的主机）。
 pub fn is_sensitive_header(name: &str) -> bool {
     matches!(
-        name.to_ascii_lowercase().as_str(),
-        "authorization" | "cookie" | "proxy-authorization"
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "cookie2" | "proxy-authorization" | "www-authenticate"
     )
 }
 
@@ -90,9 +90,10 @@ pub fn host_of(url: &str) -> Option<String> {
     let authority = authority.rsplit('@').next().unwrap_or(authority); // 去 userinfo
     if let Some(after) = authority.strip_prefix('[') {
         // IPv6
-        return after.split(']').next().map(|s| s.to_string());
+        return after.split(']').next().map(|s| s.to_ascii_lowercase());
     }
-    Some(authority.split(':').next().unwrap_or(authority).to_string())
+    // 主机名大小写不敏感：统一小写，避免"同源"被误判为跨域
+    Some(authority.split(':').next().unwrap_or(authority).to_ascii_lowercase())
 }
 
 /// 网址的端口（默认 http=80 / https=443）。
@@ -122,7 +123,9 @@ pub fn resolve_ips(host: &str) -> Vec<IpAddr> {
         .map(|it| it.map(|a| a.ip()).collect())
         .unwrap_or_default();
     v.sort_by_key(|a| a.is_ipv6());
-    v.dedup();
+    // 去重（不能只用 dedup：排序只保证同族相邻，重复项未必相邻）
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|ip| seen.insert(*ip));
     v.truncate(MAX_IPS_PER_HOST);
     v
 }

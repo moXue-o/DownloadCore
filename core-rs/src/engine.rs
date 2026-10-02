@@ -39,14 +39,15 @@ impl Drop for TargetGuard {
 }
 
 /// 认领一个目标文件；已被别的下载任务占用则返回 None。
-fn acquire_target(key: &str) -> Option<TargetGuard> {
+/// 返回 `Arc`：工人线程也持有副本，保证"只要还有工人在写，锁就不释放"。
+fn acquire_target(key: &str) -> Option<Arc<TargetGuard>> {
     let set = ACTIVE_TARGETS.get_or_init(|| Lock::new(HashSet::new()));
     let mut g = set.lock();
     if g.contains(key) {
         None
     } else {
         g.insert(key.to_string());
-        Some(TargetGuard { key: key.to_string() })
+        Some(Arc::new(TargetGuard { key: key.to_string() }))
     }
 }
 const MAX_SLOW_RECONNECTS: usize = 8;
@@ -152,6 +153,7 @@ impl Engine {
                 return Err(fatal("busy", "目标文件正在被另一个下载任务使用"));
             }
         };
+        let _ = shared.target_guard.set(_target_guard.clone());
         shared.logf(
             "INFO",
             format!(
@@ -164,8 +166,12 @@ impl Engine {
         // 服务器不支持分段（或大小未知）：退化为单线程整文件下载
         if !pi.range_ok || size <= 0 {
             shared.logf("INFO", "模式：单线程（服务器不支持分段或大小未知）");
+            // 单线程模式不写续传状态：先清掉可能残留的旧分段状态与其输出文件，
+            // 免得以后又支持分段时拿旧的状态去"续传"一个已被重写的文件。
+            let _ = fs::remove_dir_all(&temp_dir);
+            let _ = fs::remove_file(&marker);
             shared.status(Status::Downloading);
-            if let Err(e) = self.download_whole(&shared, &marker) {
+            if let Err(e) = self.download_whole(&shared, &limiter, &marker) {
                 shared.status(Status::Failed);
                 return Err(e);
             }
@@ -407,6 +413,9 @@ impl Engine {
 
         if let Some(st) = store::load_state_file(&temp_dir.join(STATE_FILE_NAME)) {
             let has_validator = !pi.etag.is_empty() || !pi.last_modified.is_empty();
+            // 输出文件长度必须仍是当初预分配的满长（被单线程模式截断重写过就不能续传）
+            let marker_len_ok =
+                marker.metadata().map(|m| m.len() == pi.size as u64).unwrap_or(false);
             let matches = st.version == 1
                 && st.url == shared.url()
                 && st.total == pi.size
@@ -414,18 +423,11 @@ impl Engine {
                 && st.last_modified == pi.last_modified
                 && !st.parts.is_empty()
                 && marker.exists();
-            if matches && !has_validator {
-                shared.logf(
-                    "WARN",
-                    "服务器未提供 ETag/Last-Modified，无法确认文件未变；为安全起见重新下载",
-                );
-            } else if matches {
+            let usable = matches && has_validator && marker_len_ok && parts_cover(&st.parts, pi.size);
+            if usable {
                 let mut parts = shared.parts.lock();
                 let mut queue = shared.queue.lock();
                 for ps in &st.parts {
-                    if ps.from < 0 || ps.to >= pi.size || ps.current < ps.from {
-                        continue;
-                    }
                     let p = Part::new_with(ps.from, ps.to, ps.current.min(ps.to + 1));
                     let arc = Arc::new(Lock::new(p));
                     if !arc.lock().done() {
@@ -437,6 +439,13 @@ impl Engine {
                     shared.logf("INFO", format!("发现可续传记录：共 {} 段，继续下载未完成的部分", parts.len()));
                     return Ok(());
                 }
+            } else if matches && !has_validator {
+                shared.logf(
+                    "WARN",
+                    "服务器未提供 ETag/Last-Modified，无法确认文件未变；为安全起见重新下载",
+                );
+            } else if matches {
+                shared.logf("WARN", "续传记录与输出文件对不上（长度/覆盖不符），为安全起见重新下载");
             } else {
                 shared.logf("WARN", "续传记录与服务器对不上（文件可能已变化），改为重新下载");
             }
@@ -445,6 +454,7 @@ impl Engine {
         // 全新开始：清空临时目录，建好输出文件并按总大小预分配
         let _ = fs::remove_dir_all(temp_dir);
         fs::create_dir_all(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
+        let _ = fs::remove_file(temp_dir.join(STATE_FILE_NAME)); // remove_dir_all 失败时兜底
         if let Some(parent) = marker.parent() {
             if !parent.as_os_str().is_empty() {
                 let _ = fs::create_dir_all(parent);
@@ -476,7 +486,7 @@ impl Engine {
         Ok(())
     }
 
-    fn download_whole(&self, shared: &Arc<Shared>, marker: &Path) -> Result<()> {
+    fn download_whole(&self, shared: &Arc<Shared>, limiter: &Arc<Limiter>, marker: &Path) -> Result<()> {
         let mut last_err: Option<Error> = None;
         for attempt in 0..=self.cfg.max_retries {
             if shared.is_canceled() {
@@ -485,7 +495,7 @@ impl Engine {
             if attempt > 0 {
                 thread::sleep(self.cfg.retry_delay);
             }
-            match self.download_whole_once(shared, marker) {
+            match self.download_whole_once(shared, limiter, marker) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.is_retryable() => last_err = Some(e),
                 Err(e) => return Err(e),
@@ -497,7 +507,7 @@ impl Engine {
         ))
     }
 
-    fn download_whole_once(&self, shared: &Arc<Shared>, marker: &Path) -> Result<()> {
+    fn download_whole_once(&self, shared: &Arc<Shared>, limiter: &Arc<Limiter>, marker: &Path) -> Result<()> {
         let (be, ep, src_idx) = shared.pick_source();
         let headers = shared.headers_for(&ep.url);
         let mut body = be.open_plain(&ep, &headers)?;
@@ -518,6 +528,10 @@ impl Engine {
                     file.write_all(&buf[..n]).map_err(|e| fatal("write", format!("{e}")))?;
                     shared.add_downloaded(n as i64);
                     shared.add_src_bytes(src_idx, n as i64);
+                    // 单线程模式也要限速（以前漏了）
+                    if limiter.wait(n as i64, &|| shared.is_canceled()).is_err() {
+                        return Err(Error::canceled());
+                    }
                 }
                 Err(e) => return Err(retryable("read", format!("{e}"))),
             }
@@ -555,6 +569,8 @@ struct Shared {
     src_labels: std::sync::OnceLock<Vec<String>>,
     src_bytes: std::sync::OnceLock<Vec<AtomicI64>>,
     src_conns: std::sync::OnceLock<Vec<AtomicUsize>>,
+    /// 目标文件锁：共享里也存一份，工人线程各持一份，防止主线程 panic 后提前放锁
+    target_guard: std::sync::OnceLock<Arc<TargetGuard>>,
 }
 
 struct ProgState {
@@ -589,6 +605,7 @@ impl Shared {
             src_labels: std::sync::OnceLock::new(),
             src_bytes: std::sync::OnceLock::new(),
             src_conns: std::sync::OnceLock::new(),
+            target_guard: std::sync::OnceLock::new(),
         }
     }
 
@@ -646,6 +663,20 @@ impl Shared {
             h
         } else {
             crate::backend::redact_sensitive(&h)
+        }
+    }
+
+    /// 有"身份证"时用 `If-Range` 的值（优先 ETag，其次 Last-Modified）。
+    fn if_range_value(&self) -> Option<String> {
+        let e = self.etag.lock().clone();
+        if !e.is_empty() {
+            return Some(e);
+        }
+        let m = self.last_mod.lock().clone();
+        if !m.is_empty() {
+            Some(m)
+        } else {
+            None
         }
     }
 
@@ -731,6 +762,23 @@ fn target_key(path: &Path) -> String {
     job_key(&s)
 }
 
+/// 续传记录是否完整覆盖 [0, size-1]（无缺口、无越界）。不完整就宁可重下。
+fn parts_cover(parts: &[PartState], size: i64) -> bool {
+    if size <= 0 || parts.is_empty() {
+        return false;
+    }
+    let mut v: Vec<(i64, i64)> = parts.iter().map(|p| (p.from, p.to)).collect();
+    v.sort_unstable();
+    let mut expect = 0i64;
+    for (f, t) in v {
+        if f != expect || t < f || t >= size {
+            return false;
+        }
+        expect = t + 1;
+    }
+    expect == size
+}
+
 /// 从所有段里挑"剩下活最多"的那段来分裂。
 fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
     // 收尾阶段（活跃工人很少）时，允许把尾巴切得更细，
@@ -772,6 +820,7 @@ fn spawn_part(
     let l = limiter.clone();
     let cfg = cfg.clone();
     let dir = out_file.to_path_buf();
+    let tg = shared.target_guard.get().cloned();
     let (from, to) = {
         let p = part.lock();
         (p.from, p.to)
@@ -779,6 +828,8 @@ fn spawn_part(
     s.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
     s.running.fetch_add(1, Ordering::SeqCst);
     let handle = thread::spawn(move || {
+        // 只要还有工人在写，就攥着目标文件锁（即便主线程已 panic 退出）
+        let _tg = tg;
         // 计数守卫：无论正常结束还是 panic，都保证把 running 减回去（否则主循环会永久挂死）
         struct RunningGuard(Arc<Shared>);
         impl Drop for RunningGuard {
@@ -883,7 +934,11 @@ fn download_part_once(
         }
         // 每次（重）连接都轮换一个来源：多 IP / 镜像之间轮转
         let (be, ep, src_idx) = shared.pick_source();
-        let headers = shared.headers_for(&ep.url);
+        let mut headers = shared.headers_for(&ep.url);
+        // 带身份证：内容若在下载期间变了/多来源不一致，服务器会改回 200，我们据此报错而不是拼错
+        if let Some(v) = shared.if_range_value() {
+            headers.push(("If-Range".to_string(), v));
+        }
         let body = match be.open_range(&ep, &headers, current, to) {
             Ok(b) => b,
             Err(e) => {
