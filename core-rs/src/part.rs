@@ -1,4 +1,4 @@
-/// "安全区"一次推进的步长，也是允许分裂所需的最小剩余量。
+/// "安全区"一次推进的步长，也是"正常分裂"的目标粒度下限（收尾阶段可更细）。
 /// 与 AB Download Manager 的 SAFE_ZONE_SIZE（128 * 8192 = 1 MiB）一致。
 pub const SAFETY_STEP: i64 = 1 << 20;
 
@@ -57,7 +57,7 @@ impl Part {
         true
     }
 
-    /// 返回当前允许读取的字节数；不够用时尝试推进安全区。
+    /// 返回当前允许读取的字节数；不够用时尝试推进安全区。（当前未被使用，保留作参考实现）
     #[allow(dead_code)]
     pub fn how_much_can_read(&mut self, want: i64) -> i64 {
         let mut rem = (self.safe_zone + 1 - self.current).max(0);

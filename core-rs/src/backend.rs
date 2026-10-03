@@ -202,8 +202,11 @@ pub fn build_pool(
                 Ok(pi) => {
                     if info.is_none() {
                         info = Some(pi);
+                        healthy.push(ep.clone()); // 第一个成功来源
+                    } else if same_file(info.as_ref().unwrap(), &pi) {
+                        // 其余 IP 也必须确认是"同一份文件"才采纳，否则不混拼
+                        healthy.push(ep.clone());
                     }
-                    healthy.push(ep.clone()); // 只保留"探得通"的来源（剔除死 IP）
                 }
                 Err(e) => last_err = Some(e),
             }

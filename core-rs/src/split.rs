@@ -1,6 +1,6 @@
 /// 把 [0, size) 切成尽量均匀的若干段（闭区间）。
 ///
-/// 段数同时受 `min_part_size`（段不能太小）和 `max_part_count`（段数上限）约束。
+/// 段数受 `min_part_size`（目标粒度，单段可能略小）和 `max_part_count`（段数上限）约束。
 /// 余数摊到前几段，保证各段长度最多相差 1 字节。
 pub fn split_to_range(size: i64, min_part_size: i64, max_part_count: usize) -> Vec<(i64, i64)> {
     if size <= 0 {

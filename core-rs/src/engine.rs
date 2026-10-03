@@ -22,6 +22,9 @@ const SLOW_MIN_BYTES: i64 = 512 << 10;
 const SLOW_REMAINING_MIN: i64 = 64 << 10;
 /// 收尾阶段（活跃工人很少）允许把尾巴切到的最小粒度
 const TAIL_MIN: i64 = 128 << 10;
+/// 只有"剩余未下总量"低于它（且活跃很少）才启用尾巴细切，
+/// 否则 initial 很小的大文件会被切成一堆小段
+const TAIL_SPLIT_REMAINING: i64 = 8 << 20;
 /// 段数上限：防止"尾巴切细"把 parts 无限撑大（超大文件时的内存/序列化/O(n²) 保护）
 const MAX_PARTS: usize = 4096;
 /// 预分配上限：超过就不 set_len（防恶意服务器谎报超大 total 造成巨额占盘）
@@ -940,7 +943,17 @@ fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
     // 收尾阶段（活跃工人很少）时，允许把尾巴切得更细，
     // 免得最后几 MB 只剩一条被限速的连接慢慢滴。
     let running = shared.running.load(Ordering::SeqCst);
-    let min_delta = if running <= 2 { TAIL_MIN } else { cfg.min_part_size.max(SAFETY_STEP) };
+    let remaining: i64 = shared
+        .parts
+        .lock()
+        .iter()
+        .map(|p| {
+            let p = p.lock();
+            (p.to - p.current + 1).max(0)
+        })
+        .sum();
+    let tail = running <= 2 && remaining <= TAIL_SPLIT_REMAINING;
+    let min_delta = if tail { TAIL_MIN } else { cfg.min_part_size.max(SAFETY_STEP) };
     // 先选出目标段（锁的作用域到 block 结束就释放，避免重复加锁死锁）
     let best = {
         let parts = shared.parts.lock();
@@ -1055,10 +1068,17 @@ fn run_part(
                 last_err = Some(retryable("part", "连接提前结束"));
             }
             Err(e) if e.kind == ErrorKind::Retryable => {
-                shared.logf(
-                    "WARN",
-                    format!("本段下载出错，准备重试（第 {} 次）：段 [{from}, {to}]，已到 {cur}，错误={e}", attempt + 1),
-                );
+                if attempt < cfg.max_retries {
+                    shared.logf(
+                        "WARN",
+                        format!("本段下载出错，准备重试（第 {} 次）：段 [{from}, {to}]，已到 {cur}，错误={e}", attempt + 1),
+                    );
+                } else {
+                    shared.logf(
+                        "WARN",
+                        format!("本段下载出错，已达重试上限：段 [{from}, {to}]，已到 {cur}，错误={e}"),
+                    );
+                }
                 last_err = Some(e);
             }
             Err(e) => return Err(e),
