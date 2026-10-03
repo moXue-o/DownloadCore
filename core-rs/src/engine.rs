@@ -1059,8 +1059,8 @@ fn spawn_part(
             }
         }
     });
-    s_log.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
     workers.push(handle);
+    s_log.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
 }
 
 fn run_part(
