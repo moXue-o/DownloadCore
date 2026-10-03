@@ -895,7 +895,7 @@ fn resolve(base: &ParsedUrl, location: &str) -> String {
         return format!("{}{}", base.origin, base.path_query);
     }
     if loc.starts_with('/') {
-        return format!("{}{}", base.origin, loc);
+        return format!("{}{}", base.origin, remove_dot_segments(loc));
     }
     // 目录相对：以 base 的目录为基，合并并处理 ./ ../
     let base_path = base.path_query.split(['?', '#']).next().unwrap_or("/");
@@ -1046,5 +1046,7 @@ mod tests {
         assert_eq!(resolve(&base, "."), "http://h/a/b/");
         assert_eq!(resolve(&base, ".."), "http://h/a/");
         assert_eq!(resolve(&base, "a//b"), "http://h/a/b/a//b");
+        assert_eq!(resolve(&base, "/./g"), "http://h/g");
+        assert_eq!(resolve(&base, "/../g"), "http://h/g");
     }
 }
