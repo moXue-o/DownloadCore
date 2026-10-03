@@ -63,11 +63,15 @@ impl Default for Config {
 impl Config {
     /// 把明显不合理的参数拉回可用范围。
     pub fn normalized(mut self) -> Config {
+        if self.max_threads == 0 {
+            self.max_threads = 1;
+        }
         if self.initial_threads == 0 {
             self.initial_threads = 1;
         }
-        if self.max_threads < self.initial_threads {
-            self.max_threads = self.initial_threads;
+        // 尊重"最多工人数"：initial 不该超过 max（而不是把 max 静默抬上去）
+        if self.initial_threads > self.max_threads {
+            self.initial_threads = self.max_threads;
         }
         if self.buffer_size == 0 {
             self.buffer_size = 256 << 10;
@@ -92,5 +96,27 @@ impl Config {
             self.user_agent = DEFAULT_USER_AGENT.to_string();
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_threads_is_the_cap() {
+        // 宿主只设 max_threads=1（initial 留默认 32）时，不能把 max 静默抬回 32
+        let mut c = Config::default();
+        c.max_threads = 1;
+        let n = c.normalized();
+        assert_eq!(n.max_threads, 1);
+        assert!(n.initial_threads <= 1);
+    }
+
+    #[test]
+    fn idle_timeout_zero_is_replaced() {
+        let mut c = Config::default();
+        c.idle_timeout = Duration::ZERO;
+        assert!(!c.normalized().idle_timeout.is_zero());
     }
 }

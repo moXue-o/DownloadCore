@@ -510,3 +510,90 @@ fn marker_alias_is_mutually_excluded() {
     assert!(err.message.contains("正在被另一个"), "别名为标记路径时也应被拒绝: {}", err.message);
     h.join().unwrap();
 }
+
+#[test]
+fn setup_failure_reports_failed_status() {
+    let data = make_data(1 << 20, 22);
+    let srv = TestServer::new(data);
+    let dir = unique_dir("setupfail");
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"x").unwrap(); // 这是个文件，不是目录
+    let out = blocker.join("sub").join("out.bin"); // 父目录建不出来 → setup_paths 失败
+    let engine = Engine::new(test_config(&dir));
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let cbs = Callbacks {
+        on_status: Some(Box::new(move |s| s2.lock().unwrap().push(s.as_str().to_string()))),
+        ..Default::default()
+    };
+    let err = engine
+        .download(
+            Request { url: srv.url(), target_file: Some(out.display().to_string()), ..Default::default() },
+            cbs,
+        )
+        .unwrap_err();
+    assert!(!err.message.is_empty());
+    let st = seen.lock().unwrap().clone();
+    assert!(st.iter().any(|s| s == "failed"), "早期失败也应报 failed，实际 {:?}", st);
+}
+
+#[test]
+fn resume_progress_starts_from_completed_bytes() {
+    let data = make_data(4 << 20, 23);
+    let srv = TestServer::new(data.clone());
+    srv.set_speed(2 << 20);
+    let dir = unique_dir("resumeprog");
+    let out = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.initial_threads = 1;
+    cfg.max_threads = 1;
+    cfg.max_retries = 0;
+    cfg.idle_timeout = Duration::from_secs(5);
+    let engine = Engine::new(cfg);
+
+    // 先下一部分就取消（等过 1s，保证续传状态已落盘）
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1500));
+        c2.store(true, Ordering::SeqCst);
+    });
+    let _ = engine.download(
+        Request {
+            url: srv.url(),
+            target_file: Some(out.display().to_string()),
+            cancel: Some(cancel),
+            ..Default::default()
+        },
+        Callbacks::default(),
+    );
+
+    // 恢复：确认走了续传，且第一个进度回调的 downloaded 已回填
+    srv.set_speed(1 << 20);
+    let first = Arc::new(Mutex::new(-1i64));
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let f2 = first.clone();
+    let l2 = logs.clone();
+    let cbs = Callbacks {
+        on_progress: Some(Box::new(move |p| {
+            let mut g = f2.lock().unwrap();
+            if *g < 0 {
+                *g = p.downloaded;
+            }
+        })),
+        on_log: Some(Box::new(move |e| l2.lock().unwrap().push(e.message))),
+        ..Default::default()
+    };
+    let res = engine
+        .download(
+            Request { url: srv.url(), target_file: Some(out.display().to_string()), ..Default::default() },
+            cbs,
+        )
+        .unwrap();
+    assert_eq!(read_file(&res.path), data);
+    let resumed = logs.lock().unwrap().join("\n").contains("可续传记录");
+    assert!(resumed, "这次应当走续传");
+    let f = *first.lock().unwrap();
+    assert!(f > 0, "续传进度应从已完成字节起算，实际 {f}");
+}

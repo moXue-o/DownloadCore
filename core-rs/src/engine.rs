@@ -199,7 +199,13 @@ impl Engine {
         *shared.last_mod.lock() = pi.last_modified.clone();
 
         // 确定最终路径
-        let (final_path, temp_dir) = self.setup_paths(&req, &pi)?;
+        let (final_path, temp_dir) = match self.setup_paths(&req, &pi) {
+            Ok(x) => x,
+            Err(e) => {
+                shared.status(Status::Failed);
+                return Err(e);
+            }
+        };
         let marker = PathBuf::from(format!("{}{}", final_path.display(), self.cfg.incomplete_suffix));
         let _ = shared.out_path.set(marker.clone());
 
@@ -257,9 +263,9 @@ impl Engine {
             return Ok(DownloadResult {
                 path: final_path.display().to_string(),
                 size: shared.downloaded.load(Ordering::SeqCst).max(size),
-                speed: speed_of(shared.downloaded.load(Ordering::SeqCst), start.elapsed()),
+                speed: speed_of(shared.session_bytes.load(Ordering::SeqCst), start.elapsed()),
                 parts: 0,
-                range_ok: false,
+                range_ok: pi.range_ok,
             });
         }
 
@@ -272,7 +278,10 @@ impl Engine {
         );
 
         // 分段模式
-        self.prepare_parts(&shared, &pi, &temp_dir, &marker)?;
+        if let Err(e) = self.prepare_parts(&shared, &pi, &temp_dir, &marker) {
+            shared.status(Status::Failed);
+            return Err(e);
+        }
 
         shared.status(Status::Downloading);
 
@@ -419,7 +428,7 @@ impl Engine {
         shared.status(Status::Completed);
 
         let downloaded = shared.downloaded.load(Ordering::SeqCst);
-        let speed = speed_of(downloaded, start.elapsed());
+        let speed = speed_of(shared.session_bytes.load(Ordering::SeqCst), start.elapsed());
         shared.logf(
             "INFO",
             format!(
@@ -507,7 +516,18 @@ impl Engine {
                     parts.push(arc);
                 }
                 if !parts.is_empty() {
-                    shared.logf("INFO", format!("发现可续传记录：共 {} 段，继续下载未完成的部分", parts.len()));
+                    // 回填"已完成字节"，让进度从正确位置起算（速度只看本次会话）
+                    let done: i64 = st
+                        .parts
+                        .iter()
+                        .map(|p| (p.current.min(p.to + 1) - p.from).max(0))
+                        .sum();
+                    shared.downloaded.store(done, Ordering::SeqCst);
+                    shared.prog.lock().last_emit_bytes = done;
+                    shared.logf(
+                        "INFO",
+                        format!("发现可续传记录：共 {} 段（已完成 {} 字节），继续下载未完成的部分", parts.len(), done),
+                    );
                     return Ok(());
                 }
             } else if matches && !has_validator {
@@ -618,6 +638,8 @@ struct Shared {
     queue: Lock<VecDeque<Arc<Lock<Part>>>>,
     first_err: Lock<Option<Error>>,
     downloaded: AtomicI64,
+    /// 本次会话真正新下的字节（进度要含续传已完成量，速度只看本次）
+    session_bytes: AtomicI64,
     cancel: AtomicBool,
     external: Option<Arc<AtomicBool>>,
     external_pause: Option<Arc<AtomicBool>>,
@@ -660,6 +682,7 @@ impl Shared {
             queue: Lock::new(VecDeque::new()),
             first_err: Lock::new(None),
             downloaded: AtomicI64::new(0),
+            session_bytes: AtomicI64::new(0),
             cancel: AtomicBool::new(false),
             external,
             external_pause,
@@ -770,6 +793,7 @@ impl Shared {
     }
 
     fn add_downloaded(&self, n: i64) {
+        self.session_bytes.fetch_add(n, Ordering::SeqCst);
         let total = self.downloaded.fetch_add(n, Ordering::SeqCst) + n;
         let Some(cb) = &self.cbs.on_progress else { return };
         let now = Instant::now();

@@ -42,6 +42,7 @@ const DC_ERR_HTTP: c_int = 5;
 const DC_ERR_IO: c_int = 6;
 const DC_ERR_INVALID: c_int = 7;
 const DC_ERR_INTERNAL: c_int = 8;
+const DC_ERR_TARGET_BUSY: c_int = 9;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -59,22 +60,24 @@ fn error_code(e: &crate::errors::Error) -> c_int {
     if e.kind == ErrorKind::Canceled {
         return DC_ERR_CANCELED;
     }
-    if e.message.starts_with(ERR_TOO_MANY_FAILURES) {
-        return DC_ERR_RETRY_EXHAUSTED;
-    }
+    // 分段不一致要优先判：它会被包成"重试次数用尽"，否则就永远报不出 DC_ERR_RANGE
     if e.op == "range" || e.message.contains(ERR_RANGE_MISMATCH) {
         return DC_ERR_RANGE;
+    }
+    if e.message.starts_with(ERR_TOO_MANY_FAILURES) {
+        return DC_ERR_RETRY_EXHAUSTED;
     }
     match e.op {
         "write" | "open" | "create" | "mkdir" | "assemble" | "rename" | "preallocate" | "seek" => {
             DC_ERR_IO
         }
-        "busy" => DC_ERR_BUSY,
+        // 目标文件被别的任务占（区别于"同一句柄重入"的 DC_ERR_BUSY）
+        "busy" => DC_ERR_TARGET_BUSY,
         // 网络层错误（既不是"参数无效"，也不是磁盘/内部错误）
         "send" | "connect" | "tls" | "probe" | "response" | "read" | "range" | "whole"
         | "redirect" => DC_ERR_HTTP,
-        // 真正的参数问题（如 URL 为空）
-        "request" => DC_ERR_INVALID,
+        // 真正的参数问题（URL 为空/非法、构造失败）
+        "url" | "request" => DC_ERR_INVALID,
         _ => {
             if e.message.contains("builder error") || e.message.contains("invalid URL") {
                 DC_ERR_INVALID
@@ -532,5 +535,28 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_config, max_speed), 56);
         assert_eq!(offset_of!(dc_config, adaptive_threads), 64);
         assert_eq!(offset_of!(dc_config, use_multiple_ips), 68);
+    }
+
+    #[test]
+    fn error_code_mapping() {
+        use crate::errors::{fatal, retryable, Error, ERR_RANGE_MISMATCH, ERR_TOO_MANY_FAILURES};
+        assert_eq!(error_code(&Error::canceled()), DC_ERR_CANCELED);
+        // 非法 URL → INVALID（不是 INTERNAL）
+        assert_eq!(error_code(&fatal("url", "网址不合法: x")), DC_ERR_INVALID);
+        // 重试次数用尽 → RETRY_EXHAUSTED
+        assert_eq!(
+            error_code(&fatal("part", format!("{ERR_TOO_MANY_FAILURES}: x"))),
+            DC_ERR_RETRY_EXHAUSTED
+        );
+        // 分段不一致即使被包成"重试次数用尽"，也要报 RANGE（不能死码）
+        assert_eq!(
+            error_code(&fatal("part", format!("{ERR_TOO_MANY_FAILURES}: {ERR_RANGE_MISMATCH}: x"))),
+            DC_ERR_RANGE
+        );
+        assert_eq!(error_code(&retryable("range", format!("{ERR_RANGE_MISMATCH}: x"))), DC_ERR_RANGE);
+        // 目标被占 vs 磁盘/网络
+        assert_eq!(error_code(&fatal("busy", "目标文件正在被另一个下载任务使用")), DC_ERR_TARGET_BUSY);
+        assert_eq!(error_code(&fatal("write", "x")), DC_ERR_IO);
+        assert_eq!(error_code(&retryable("connect", "x")), DC_ERR_HTTP);
     }
 }
