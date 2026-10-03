@@ -155,12 +155,19 @@ impl Engine {
 
         shared.status(Status::Probing);
         // 建来源池（主地址 + 镜像/多 IP）并探路
+        // 探路用的头：先剥掉用户的 Accept-Encoding（我们只发 identity；LTS 探路也走这里）
+        let probe_headers: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"))
+            .cloned()
+            .collect();
         let (eps, pi) = match build_pool(
             self.backend.as_ref(),
             &self.cfg,
             &req.url,
             &req.mirrors,
-            &req.headers,
+            &probe_headers,
             &|| shared.is_canceled(),
         ) {
             Ok(x) => x,
@@ -781,12 +788,7 @@ impl Shared {
     }
 
     fn save_state(&self, temp_dir: &Path) {
-        // 先把输出文件的已写数据落盘，再记状态——否则"状态超前于数据"，断电后续传会跳过没落盘的区域
-        if let Some(p) = self.out_path.get() {
-            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) {
-                let _ = f.sync_all();
-            }
-        }
+        // 1) 先取快照（读各段 current）
         let parts: Vec<PartState> = self
             .parts
             .lock()
@@ -808,6 +810,14 @@ impl Shared {
             last_modified: self.last_mod.lock().clone(),
             parts,
         };
+        // 2) 再 fsync 输出文件：保证"快照覆盖的字节"都已落盘
+        //    （顺序不能反：先 fsync 再取快照，仍会有"快照超前于落盘"的窗口）
+        if let Some(p) = self.out_path.get() {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) {
+                let _ = f.sync_all();
+            }
+        }
+        // 3) 最后写状态文件（状态永远 ≤ 已落盘数据，最坏只是重下一点）
         if let Err(e) = store::save_state_file(&temp_dir.join(STATE_FILE_NAME), &st) {
             self.logf("WARN", format!("保存续传记录失败：{e}"));
         }

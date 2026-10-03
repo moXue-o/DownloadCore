@@ -223,11 +223,10 @@ impl Backend for LtsBackend {
         let mut info = ProbeInfo { size: 0, range_ok: false, etag, last_modified, file_name };
         if status == 206 {
             if let Some((start, _end, total)) = parse_content_range(&content_range) {
+                // 只有总长已知（非 `*`）才敢定 size
                 if start == 0 && total > 0 {
                     info.range_ok = true;
                     info.size = total;
-                } else if clen > 0 {
-                    info.size = clen;
                 }
             }
         } else if (200..300).contains(&status) {

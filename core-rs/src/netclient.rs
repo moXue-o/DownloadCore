@@ -135,11 +135,10 @@ impl NetClient {
         let mut info = ProbeInfo { size: 0, range_ok: false, etag, last_modified, file_name };
         if status == 206 {
             if let Some((start, _end, total)) = parse_content_range(&content_range) {
+                // 只有总长已知（非 `*`）才敢定 size；`bytes 0-0/*` 时 size 未知，交给整文件模式
                 if start == 0 && total > 0 {
                     info.range_ok = true;
                     info.size = total;
-                } else if clen > 0 {
-                    info.size = clen;
                 }
             }
         } else if (200..300).contains(&status) {
@@ -907,27 +906,58 @@ fn resolve(base: &ParsedUrl, location: &str) -> String {
     format!("{}{}", base.origin, merge_path(dir, loc))
 }
 
-/// 按 RFC 3986 的“合并路径”语义，把相对引用并到目录上。
+/// 按 RFC 3986 的“合并路径”语义，把相对引用并到目录上（保留尾部斜杠与空段）。
 fn merge_path(dir: &str, rel: &str) -> String {
     let (rel_path, suffix) = match rel.find(['?', '#']) {
         Some(i) => (&rel[..i], &rel[i..]),
         None => (rel, ""),
     };
-    let mut segs: Vec<&str> = dir.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
-    for part in rel_path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                segs.pop();
+    let merged = format!("{dir}{rel_path}");
+    let out = remove_dot_segments(&merged);
+    format!("{out}{suffix}")
+}
+
+/// RFC 3986 §5.2.4：去掉路径里的 `.` / `..`，并保留结尾斜杠。
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path.to_string();
+    let mut output = String::new();
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest.to_string();
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest.to_string();
+        } else if let Some(rest) = input.strip_prefix("/./") {
+            input = format!("/{rest}");
+        } else if input == "/." {
+            input = "/".to_string();
+        } else if let Some(rest) = input.strip_prefix("/../") {
+            input = format!("/{rest}");
+            if let Some(i) = output.rfind('/') {
+                output.truncate(i);
             }
-            p => segs.push(p),
+        } else if input == "/.." {
+            input = "/".to_string();
+            if let Some(i) = output.rfind('/') {
+                output.truncate(i);
+            }
+        } else if input == "." || input == ".." {
+            input.clear();
+        } else {
+            // 取第一段（到下一个 '/' 为止）
+            let start = usize::from(input.starts_with('/'));
+            match input[start..].find('/').map(|i| i + start) {
+                Some(i) => {
+                    output.push_str(&input[..i]);
+                    input = input[i..].to_string();
+                }
+                None => {
+                    output.push_str(&input);
+                    input.clear();
+                }
+            }
         }
     }
-    if segs.is_empty() {
-        format!("/{suffix}")
-    } else {
-        format!("/{}{suffix}", segs.join("/"))
-    }
+    output
 }
 
 // ---------------- 接入统一后端接口 ----------------
@@ -1007,5 +1037,14 @@ mod tests {
         assert_eq!(resolve(&base, "/root"), "http://h/root");
         assert_eq!(resolve(&base, "//other/z"), "http://other/z");
         assert_eq!(resolve(&base, "https://x/y"), "https://x/y");
+    }
+
+    #[test]
+    fn resolve_keeps_trailing_slash_and_empty_segments() {
+        let base = parse_url("http://h/a/b/c").unwrap();
+        assert_eq!(resolve(&base, "g/"), "http://h/a/b/g/");
+        assert_eq!(resolve(&base, "."), "http://h/a/b/");
+        assert_eq!(resolve(&base, ".."), "http://h/a/");
+        assert_eq!(resolve(&base, "a//b"), "http://h/a/b/a//b");
     }
 }
