@@ -226,7 +226,7 @@ impl Backend for LtsBackend {
         let etag = header_str(&resp, "etag");
         let last_modified = header_str(&resp, "last-modified");
         let file_name = parse_filename(&header_str(&resp, "content-disposition"));
-        let clen = resp.content_length().map(|v| v as i64).unwrap_or(0);
+        let clen = resp.content_length().map(|v| v.min(i64::MAX as u64) as i64).unwrap_or(0);
         let content_range = header_str(&resp, "content-range");
         let accept_ranges = header_str(&resp, "accept-ranges");
         drop(resp);

@@ -7,7 +7,8 @@ pub fn split_to_range(size: i64, min_part_size: i64, max_part_count: usize) -> V
         return Vec::new();
     }
     let min_part_size = min_part_size.max(1);
-    let max_part_count = max_part_count.max(1) as i64;
+    // 段数先夹住，防 `usize as i64` 截断成负数 / 巨量 with_capacity
+    let max_part_count = max_part_count.min(65536).max(1) as i64;
 
     // 至少能切出多少个"最小块"（saturating 防服务器谎报超大 size 时溢出）
     let min_parts = size.saturating_add(min_part_size - 1) / min_part_size;
@@ -53,5 +54,12 @@ mod tests {
         let r = split_to_range(2, 3, 8);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0], (0, 1));
+    }
+
+    #[test]
+    fn huge_max_part_count_does_not_panic() {
+        let r = split_to_range(1000, 1, usize::MAX);
+        assert!(!r.is_empty());
+        assert!(r.len() <= 65536);
     }
 }

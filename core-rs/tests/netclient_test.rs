@@ -131,6 +131,64 @@ fn early_hints_are_skipped() {
     assert_eq!(read_all(body), data, "1xx 临时响应应被跳过");
 }
 
+/// 起一个只应答一次的自定义服务器：读完请求头后执行 `write`。
+fn raw_server(write: impl FnOnce(&mut std::net::TcpStream) + Send + 'static) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            loop {
+                let mut l = String::new();
+                if r.read_line(&mut l).unwrap() == 0 || l == "\r\n" {
+                    break;
+                }
+            }
+            write(&mut s);
+            let _ = s.flush();
+        }
+    });
+    format!("http://{addr}/f")
+}
+
+#[test]
+fn too_many_interim_responses_errors() {
+    let url = raw_server(|s| {
+        for _ in 0..50 {
+            let _ = s.write_all(b"HTTP/1.1 103 Early Hints\r\n\r\n");
+        }
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+    });
+    let err = client().probe(&Target::new(url), &[]).unwrap_err();
+    assert!(!err.message.is_empty(), "1xx 洪泛应报错而不是一直读");
+}
+
+#[test]
+fn chunked_empty_line_flood_errors() {
+    let url = raw_server(|s| {
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        for _ in 0..1_000_000 {
+            if s.write_all(b"\r\n").is_err() {
+                break;
+            }
+        }
+    });
+    let mut body = client().open_plain(&Target::new(url), &[]).unwrap();
+    let mut buf = [0u8; 1024];
+    let mut errored = false;
+    for _ in 0..1000 {
+        match body.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    assert!(errored, "空行洪泛应报错而不是一直读");
+}
+
 #[test]
 fn idle_timeout_is_reported() {
     let srv = TestServer::new(make_data(2 << 20, 11));

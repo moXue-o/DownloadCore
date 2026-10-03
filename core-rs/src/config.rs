@@ -69,6 +69,14 @@ impl Config {
         if self.initial_threads == 0 {
             self.initial_threads = 1;
         }
+        // 上限保护：防宿主传入超大值导致巨量分段/Vec 分配
+        const MAX_WORKERS: usize = 1024;
+        if self.initial_threads > MAX_WORKERS {
+            self.initial_threads = MAX_WORKERS;
+        }
+        if self.max_threads > MAX_WORKERS {
+            self.max_threads = MAX_WORKERS;
+        }
         // 尊重"最多工人数"：initial 不该超过 max（而不是把 max 静默抬上去）
         if self.initial_threads > self.max_threads {
             self.initial_threads = self.max_threads;
@@ -118,5 +126,15 @@ mod tests {
         let mut c = Config::default();
         c.idle_timeout = Duration::ZERO;
         assert!(!c.normalized().idle_timeout.is_zero());
+    }
+
+    #[test]
+    fn worker_count_is_capped() {
+        let mut c = Config::default();
+        c.initial_threads = usize::MAX;
+        c.max_threads = usize::MAX;
+        let n = c.normalized();
+        assert!(n.initial_threads <= 1024);
+        assert!(n.max_threads <= 1024);
     }
 }

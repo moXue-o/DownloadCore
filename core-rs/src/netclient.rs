@@ -36,6 +36,11 @@ const MAX_CONNECT_ADDRS: usize = 4;
 const BAD_ADDR_COOLDOWN: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: usize = 500;
+/// 单次请求最多容忍多少个 1xx 临时响应
+const MAX_INTERIM_RESPONSES: usize = 10;
+/// chunked 里连续空行 / trailer 行数上限（防坏服务器持续发控制行让读永不返回）
+const MAX_CHUNK_EMPTY_LINES: usize = 64;
+const MAX_CHUNK_TRAILERS: usize = 1024;
 /// 每个来源最多缓存多少条空闲长连接（对齐最大并发，避免"用完就关、下次重连"）
 const POOL_MAX_IDLE: usize = 32;
 /// 连接池最多记多少个"来源键"；超过就清理过期项（防跨大量主机长期运行无界增长）
@@ -98,6 +103,12 @@ pub struct NetClient {
 
 impl NetClient {
     pub fn new(user_agent: impl Into<String>, idle_timeout: Duration) -> Self {
+        // 读超时为 0 会让 set_read_timeout 静默失败 → 卡死；这里兜底成默认 15s
+        let idle_timeout = if idle_timeout.is_zero() {
+            Duration::from_secs(15)
+        } else {
+            idle_timeout
+        };
         NetClient {
             user_agent: user_agent.into(),
             idle_timeout,
@@ -320,10 +331,15 @@ impl NetClient {
             .map_err(|e| map_io("send", e))?;
         reader.get_mut().flush().map_err(|e| map_io("send", e))?;
         // 跳过 1xx 临时响应（103 Early Hints 等），一直读到最终响应
+        let mut interim = 0usize;
         loop {
             let status = read_status_line(reader)?;
             let hdrs = read_headers(reader)?;
             if (100..200).contains(&status) && status != 101 {
+                interim += 1;
+                if interim > MAX_INTERIM_RESPONSES {
+                    return Err(retryable("response", "1xx 临时响应过多"));
+                }
                 continue;
             }
             return Ok((status, hdrs));
@@ -608,49 +624,63 @@ fn read_mode(inner: &mut BufReader<Stream>, mode: &mut Mode, buf: &mut [u8]) -> 
             Ok(got)
         }
         Mode::Eof => inner.read(buf),
-        Mode::Chunked { remaining, done, need_crlf } => loop {
-            if *done {
-                return Ok(0);
-            }
-            if *need_crlf {
-                let line = read_line(inner)?;
-                *need_crlf = false;
-                if !line.is_empty() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk 后缺少 CRLF"));
-                }
-            }
-            if *remaining == 0 {
-                let line = read_line(inner)?;
-                if line.is_empty() {
-                    continue; // 容忍多余空行
-                }
-                let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("chunk 大小不合法: {line}"))
-                    })?;
-                if size == 0 {
-                    // 收尾：读掉 trailer，直到空行
-                    loop {
-                        if read_line(inner)?.is_empty() {
-                            break;
-                        }
-                    }
-                    *done = true;
+        Mode::Chunked { remaining, done, need_crlf } => {
+            let mut empty_lines = 0usize;
+            loop {
+                if *done {
                     return Ok(0);
                 }
-                *remaining = size;
+                if *need_crlf {
+                    let line = read_line(inner)?;
+                    *need_crlf = false;
+                    if !line.is_empty() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk 后缺少 CRLF"));
+                    }
+                }
+                if *remaining == 0 {
+                    let line = read_line(inner)?;
+                    if line.is_empty() {
+                        // 容忍少量空行；但必须封顶，否则坏服务器持续发空行会让这里永不返回
+                        empty_lines += 1;
+                        if empty_lines > MAX_CHUNK_EMPTY_LINES {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk 空行过多"));
+                        }
+                        continue;
+                    }
+                    empty_lines = 0;
+                    let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, format!("chunk 大小不合法: {line}"))
+                        })?;
+                    if size == 0 {
+                        // 收尾：读掉 trailer，直到空行（同样要封顶）
+                        let mut trailers = 0usize;
+                        loop {
+                            if read_line(inner)?.is_empty() {
+                                break;
+                            }
+                            trailers += 1;
+                            if trailers > MAX_CHUNK_TRAILERS {
+                                return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk trailer 过多"));
+                            }
+                        }
+                        *done = true;
+                        return Ok(0);
+                    }
+                    *remaining = size;
+                }
+                let want = (*remaining).min(buf.len() as u64) as usize;
+                let got = inner.read(&mut buf[..want])?;
+                if got == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk 数据提前结束"));
+                }
+                *remaining -= got as u64;
+                if *remaining == 0 {
+                    *need_crlf = true;
+                }
+                return Ok(got);
             }
-            let want = (*remaining).min(buf.len() as u64) as usize;
-            let got = inner.read(&mut buf[..want])?;
-            if got == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk 数据提前结束"));
-            }
-            *remaining -= got as u64;
-            if *remaining == 0 {
-                *need_crlf = true;
-            }
-            return Ok(got);
-        },
+        }
     }
 }
 
@@ -874,7 +904,13 @@ fn split_host_port(authority: &str, https: bool) -> Result<(String, u16)> {
         if let Some(close) = after.find(']') {
             let host = &after[..close];
             let rest = &after[close + 1..];
-            let port = rest.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(default_port);
+            // 显式端口非法要报错，别静默回退默认端口（与非 IPv6 分支保持一致）
+            let port = match rest.strip_prefix(':') {
+                Some(p) if !p.is_empty() => {
+                    p.parse::<u16>().map_err(|_| fatal("url", format!("端口不合法: {p}")))?
+                }
+                _ => default_port,
+            };
             return Ok((host.to_string(), port));
         }
     }
@@ -1079,5 +1115,19 @@ mod tests {
         assert_eq!(resolve(&base, "a//b"), "http://h/a/b/a//b");
         assert_eq!(resolve(&base, "/./g"), "http://h/g");
         assert_eq!(resolve(&base, "/../g"), "http://h/g");
+    }
+
+    #[test]
+    fn ipv6_port_is_validated() {
+        assert_eq!(parse_url("https://[::1]:8443/x").unwrap().port, 8443);
+        assert_eq!(parse_url("https://[::1]/x").unwrap().port, 443);
+        assert!(parse_url("https://[::1]:70000/x").is_err());
+        assert!(parse_url("https://[::1]:abc/x").is_err());
+    }
+
+    #[test]
+    fn netclient_normalizes_zero_idle_timeout() {
+        let c = NetClient::new("ua", Duration::ZERO);
+        assert!(!c.idle_timeout.is_zero());
     }
 }

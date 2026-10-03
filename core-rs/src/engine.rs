@@ -615,6 +615,9 @@ impl Engine {
         let mut body = be.open_plain(&ep, &headers)?;
         let mut file = File::create(marker).map_err(|e| fatal("create", format!("创建文件失败: {e}")))?;
         shared.downloaded.store(0, Ordering::SeqCst);
+        // 重试从头来：进度基准和"本次会话字节"都要清零，否则进度会回退、速度会出负数
+        shared.prog.lock().last_emit_bytes = 0;
+        shared.session_bytes.store(0, Ordering::SeqCst);
         let mut buf = vec![0u8; self.cfg.buffer_size.max(64 * 1024)];
         loop {
             if shared.is_canceled() {
