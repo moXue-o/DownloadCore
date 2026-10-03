@@ -311,10 +311,17 @@ impl Engine {
 
         shared.status(Status::Downloading);
         if shared.if_range_value().is_none() {
-            shared.logf(
-                "WARN",
-                "服务器未提供 ETag/Last-Modified：分段下载无法做内容一致性校验（如需强保证，请提供 expected_sha256）",
-            );
+            let has_sum = req
+                .expected_sha256
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let msg = if has_sum {
+                "服务器未提供 ETag/Last-Modified：分段下载无法做内容一致性校验（已用 expected_sha256 兜底）"
+            } else {
+                "服务器未提供 ETag/Last-Modified：分段下载无法做内容一致性校验（如需强保证，请提供 expected_sha256）"
+            };
+            shared.logf("WARN", msg);
         }
 
         let mut workers = Workers::new(&shared);

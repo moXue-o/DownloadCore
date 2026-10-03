@@ -581,6 +581,47 @@ fn checksum_verified_before_rename() {
 }
 
 #[test]
+fn checksum_verified_single_thread() {
+    let data = make_data(1 << 20, 27);
+    let srv = TestServer::new(data.clone());
+    srv.set_no_range(true); // 走单线程整文件分支
+    let dir = unique_dir("sha-whole");
+    let out = dir.join("out.bin");
+    let engine = Engine::new(test_config(&dir));
+    let mut h = downloadcore::Sha256::new();
+    h.update(&data);
+    let good = downloadcore::to_hex(&h.finish());
+
+    let res = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                expected_sha256: Some(good),
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap();
+    assert_eq!(read_file(&res.path), data);
+
+    std::fs::remove_file(&out).ok();
+    let err = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                expected_sha256: Some("x".to_string()),
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap_err();
+    assert!(err.message.contains("校验和"));
+    assert!(!out.exists());
+}
+
+#[test]
 fn cancel_during_read_error_is_canceled_not_failed() {
     let data = make_data(2 << 20, 24);
     let srv = TestServer::new(data);

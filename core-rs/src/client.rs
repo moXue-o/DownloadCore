@@ -302,17 +302,19 @@ impl Backend for LtsBackend {
             ));
         }
         let re = header_str(&resp, "etag");
-        if !expect.etag.is_empty() && !re.is_empty() && !re.eq_ignore_ascii_case(expect.etag) {
+        let rl = header_str(&resp, "last-modified");
+        // 与 same_file 同口径："强 ETag 或 Last-Modified 任一匹配"即可
+        let etag_match = !expect.etag.is_empty() && !re.is_empty() && re.eq_ignore_ascii_case(expect.etag);
+        let lm_match =
+            !expect.last_modified.is_empty() && !rl.is_empty() && rl == expect.last_modified;
+        let etag_mismatch = !expect.etag.is_empty() && !re.is_empty() && !etag_match;
+        let lm_mismatch = !expect.last_modified.is_empty() && !rl.is_empty() && !lm_match;
+        if (etag_mismatch || lm_mismatch) && !(etag_match || lm_match) {
             self.clear_final(&cache_key(&ep.url, ep.ip));
             return Err(retryable(
                 "range",
-                format!("{ERR_RANGE_MISMATCH}: ETag 变了（探路 {}，现在 {re}）", expect.etag),
+                format!("{ERR_RANGE_MISMATCH}: 验证器变了（ETag '{re}' / Last-Modified '{rl}'）"),
             ));
-        }
-        let rl = header_str(&resp, "last-modified");
-        if !expect.last_modified.is_empty() && !rl.is_empty() && rl != expect.last_modified {
-            self.clear_final(&cache_key(&ep.url, ep.ip));
-            return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: Last-Modified 变了")));
         }
         Ok(Box::new(self.body(resp)))
     }
