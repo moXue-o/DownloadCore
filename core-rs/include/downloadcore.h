@@ -55,7 +55,8 @@ typedef enum dc_error {
     DC_ERR_IO = 6,              /* 文件/磁盘错误 */
     DC_ERR_INVALID = 7,         /* 参数无效 */
     DC_ERR_INTERNAL = 8,        /* 其它内部错误 */
-    DC_ERR_TARGET_BUSY = 9      /* 目标文件正被另一个下载任务占用 */
+    DC_ERR_TARGET_BUSY = 9,     /* 目标文件正被另一个下载任务占用 */
+    DC_ERR_CHECKSUM = 10        /* 校验和不符（expected_sha256 核对失败） */
 } dc_error;
 
 /* 下载结果（用 dc_result_free 释放其中的 path） */

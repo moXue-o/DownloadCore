@@ -128,12 +128,15 @@ pub fn write_all_at(f: &std::fs::File, buf: &[u8], mut offset: u64) -> std::io::
     use std::os::windows::fs::FileExt;
     let mut written = 0;
     while written < buf.len() {
-        let n = f.seek_write(&buf[written..], offset)?;
-        if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_at 返回 0"));
+        match f.seek_write(&buf[written..], offset) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_at 返回 0")),
+            Ok(n) => {
+                written += n;
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
-        written += n;
-        offset += n as u64;
     }
     Ok(())
 }
@@ -143,12 +146,15 @@ pub fn write_all_at(f: &std::fs::File, buf: &[u8], mut offset: u64) -> std::io::
     use std::os::unix::fs::FileExt;
     let mut written = 0;
     while written < buf.len() {
-        let n = f.write_at(&buf[written..], offset)?;
-        if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_at 返回 0"));
+        match f.write_at(&buf[written..], offset) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_at 返回 0")),
+            Ok(n) => {
+                written += n;
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
-        written += n;
-        offset += n as u64;
     }
     Ok(())
 }

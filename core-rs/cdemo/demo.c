@@ -29,6 +29,15 @@ static_assert(sizeof(dc_request) == 72, "dc_request layout mismatch");
 static_assert(sizeof(dc_config) == 72, "dc_config layout mismatch");
 static_assert(sizeof(dc_result) == 40, "dc_result layout mismatch");
 
+/* 字段偏移也要锁死（只锁大小会漏掉"同类型字段被对调"） */
+static_assert(offsetof(dc_config, min_part_size) == 8, "dc_config.min_part_size offset");
+static_assert(offsetof(dc_config, buffer_size) == 16, "dc_config.buffer_size offset");
+static_assert(offsetof(dc_config, idle_timeout_ms) == 20, "dc_config.idle_timeout_ms offset");
+static_assert(offsetof(dc_config, max_retries) == 24, "dc_config.max_retries offset");
+static_assert(offsetof(dc_config, retry_delay_ms) == 28, "dc_config.retry_delay_ms offset");
+static_assert(offsetof(dc_request, expected_sha256) == 64, "dc_request.expected_sha256 offset");
+static_assert(offsetof(dc_progress, total) == 8, "dc_progress.total offset");
+
 static FILE* g_log = NULL;
 
 /* 回调会被多个工人线程并发调用：日志与"每秒一条"的节流都要加锁 */

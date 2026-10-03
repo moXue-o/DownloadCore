@@ -976,7 +976,8 @@ fn create_dir_private(dir: &Path) -> std::io::Result<()> {
 fn target_key(path: &Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let s = abs.display().to_string();
-    let s = if cfg!(windows) { s.to_lowercase() } else { s };
+    // Windows 与 macOS 默认都大小写不敏感 → 统一小写，避免同文件被判成两个
+    let s = if cfg!(any(windows, target_os = "macos")) { s.to_lowercase() } else { s };
     job_key(&s)
 }
 

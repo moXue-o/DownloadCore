@@ -43,6 +43,7 @@ const DC_ERR_IO: c_int = 6;
 const DC_ERR_INVALID: c_int = 7;
 const DC_ERR_INTERNAL: c_int = 8;
 const DC_ERR_TARGET_BUSY: c_int = 9;
+const DC_ERR_CHECKSUM: c_int = 10;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -77,6 +78,8 @@ fn error_code(e: &crate::errors::Error) -> c_int {
         }
         // 目标文件被别的任务占（区别于"同一句柄重入"的 DC_ERR_BUSY）
         "busy" => DC_ERR_TARGET_BUSY,
+        // 校验和不符
+        "checksum" => DC_ERR_CHECKSUM,
         // 网络层错误（既不是"参数无效"，也不是磁盘/内部错误）
         "send" | "connect" | "tls" | "probe" | "response" | "read" | "range" | "whole"
         | "redirect" => DC_ERR_HTTP,
@@ -233,6 +236,11 @@ pub unsafe extern "C" fn dc_result_free(r: *mut dc_result) {
         unsafe { drop(CString::from_raw(r.path)) };
         r.path = std::ptr::null_mut();
     }
+    // 与注释一致：把所有字段清零
+    r.size = 0;
+    r.speed = 0;
+    r.parts = 0;
+    r.range_ok = 0;
 }
 
 /// 返回一套默认配置（字符串字段为空 = 用内置默认）。
@@ -511,6 +519,10 @@ mod layout_tests {
     fn c_layout_matches_header() {
         assert_eq!(align_of::<dc_progress>(), 8);
         assert_eq!(size_of::<dc_progress>(), 32);
+        assert_eq!(offset_of!(dc_progress, downloaded), 0);
+        assert_eq!(offset_of!(dc_progress, total), 8);
+        assert_eq!(offset_of!(dc_progress, speed), 16);
+        assert_eq!(offset_of!(dc_progress, parts), 24);
 
         assert_eq!(align_of::<dc_result>(), 8);
         assert_eq!(size_of::<dc_result>(), 40);
@@ -537,6 +549,10 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_config, initial_threads), 0);
         assert_eq!(offset_of!(dc_config, max_threads), 4);
         assert_eq!(offset_of!(dc_config, min_part_size), 8);
+        assert_eq!(offset_of!(dc_config, buffer_size), 16);
+        assert_eq!(offset_of!(dc_config, idle_timeout_ms), 20);
+        assert_eq!(offset_of!(dc_config, max_retries), 24);
+        assert_eq!(offset_of!(dc_config, retry_delay_ms), 28);
         assert_eq!(offset_of!(dc_config, temp_dir), 32);
         assert_eq!(offset_of!(dc_config, incomplete_suffix), 40);
         assert_eq!(offset_of!(dc_config, user_agent), 48);
@@ -564,6 +580,7 @@ mod layout_tests {
         assert_eq!(error_code(&retryable("range", format!("{ERR_RANGE_MISMATCH}: x"))), DC_ERR_RANGE);
         // 目标被占 vs 磁盘/网络
         assert_eq!(error_code(&fatal("busy", "目标文件正在被另一个下载任务使用")), DC_ERR_TARGET_BUSY);
+        assert_eq!(error_code(&fatal("checksum", "校验和不符")), DC_ERR_CHECKSUM);
         assert_eq!(error_code(&fatal("write", "x")), DC_ERR_IO);
         assert_eq!(error_code(&retryable("connect", "x")), DC_ERR_HTTP);
         // LTS 会把非法 URL 包成 send: builder error → 仍要判 INVALID
