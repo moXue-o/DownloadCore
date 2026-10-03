@@ -180,6 +180,7 @@ fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf) {
     let data: Vec<u8> = (0..size).map(|i| ((i as u64 * 31 + 7) & 0xff) as u8).collect();
 
     let (addr, stop) = start_server(data.clone());
+    let _sg = StopGuard(stop); // 任何返回路径都会停掉本地服务器
     let url = format!("http://{addr}/file.bin");
 
     let mut cfg = Config::default();
@@ -215,7 +216,14 @@ fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf) {
             println!(">>> 自检失败！详见 {LOG_FILE}");
         }
     }
-    stop.store(true, Ordering::SeqCst); // 停掉自检用的本地服务器，别每次泄漏一个线程
+}
+
+/// 离开作用域就停掉本地自检服务器。
+struct StopGuard(Arc<AtomicBool>);
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 // ---------------- 一个极简的本地测试服务器（仅用于 selftest） ----------------
@@ -230,6 +238,8 @@ fn start_server(data: Vec<u8>) -> (SocketAddr, Arc<AtomicBool>) {
         while !st.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // 监听是 nonblocking，但 accept 出来的连接在 Windows 上会继承非阻塞 → 显式改回阻塞
+                    let _ = stream.set_nonblocking(false);
                     let d = data.clone();
                     thread::spawn(move || {
                         let _ = serve(stream, &d);
