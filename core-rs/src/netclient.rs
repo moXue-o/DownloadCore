@@ -287,6 +287,10 @@ impl NetClient {
             let loc = header_get(&hdrs, "location");
             if matches!(status, 301 | 302 | 303 | 307 | 308) && !loc.is_empty() {
                 let next = resolve(&u, loc);
+                // 拒绝从 HTTPS 降级到 HTTP（内容会被明文传输、可被篡改）
+                if base.https && parse_url(&next).map(|nu| !nu.https).unwrap_or(false) {
+                    return Err(fatal("redirect", "拒绝从 HTTPS 降级到 HTTP"));
+                }
                 self.stat_follows.fetch_add(1, Ordering::Relaxed);
                 // 跳转用的连接也回收：否则每个分段都要重新和"跳转服务器"握手
                 self.recycle_conn(reader, &key, &hdrs, status);
@@ -762,7 +766,9 @@ fn build_request(
     let mut s = String::with_capacity(256);
     s.push_str(&format!("GET {} HTTP/1.1\r\n", u.path_query));
     s.push_str(&format!("Host: {host_header}\r\n"));
-    s.push_str(&format!("User-Agent: {user_agent}\r\n"));
+    // User-Agent 也要防注入（去掉 CR/LF）
+    let ua: String = user_agent.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    s.push_str(&format!("User-Agent: {ua}\r\n"));
     s.push_str("Accept: */*\r\n");
     s.push_str("Accept-Encoding: identity\r\n");
 
@@ -809,6 +815,11 @@ struct ParsedUrl {
     origin: String,
 }
 
+/// 是否含控制字符（CR/LF/NUL 等）——URL 里出现它们会造成请求注入。
+fn has_ctl(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
 fn parse_url(raw: &str) -> Result<ParsedUrl> {
     let raw = raw.trim();
     // 去掉 fragment（#...）：它不属于请求目标
@@ -817,7 +828,7 @@ fn parse_url(raw: &str) -> Result<ParsedUrl> {
         None => raw,
     };
     let (scheme, rest) =
-        raw.split_once("://").ok_or_else(|| fatal("url", format!("网址不合法: {raw}")))?;
+        raw.split_once("://").ok_or_else(|| fatal("url", "网址不合法（缺少 ://）"))?;
     let scheme_l = scheme.to_ascii_lowercase();
     let https = match scheme_l.as_str() {
         "http" => false,
@@ -836,7 +847,11 @@ fn parse_url(raw: &str) -> Result<ParsedUrl> {
     let authority = &rest[..end];
     let path = &rest[end..];
     if authority.is_empty() {
-        return Err(fatal("url", format!("网址缺少主机: {raw}")));
+        return Err(fatal("url", "网址缺少主机"));
+    }
+    // 拒绝控制字符：否则 path/query 会被原样拼进请求行，可注入请求头/第二个请求
+    if has_ctl(authority) || has_ctl(path) {
+        return Err(fatal("url", "网址含非法控制字符（CR/LF 等）"));
     }
 
     let (host, port) = split_host_port(authority, https)?;
@@ -1025,6 +1040,20 @@ mod tests {
         assert_eq!(u.path_query, "/a/b");
         let u = parse_url("https://host").unwrap();
         assert_eq!((u.port, u.path_query.as_str()), (443, "/"));
+    }
+
+    #[test]
+    fn parse_url_rejects_crlf_injection() {
+        assert!(parse_url("http://h/a\r\nX-Injected: 1").is_err());
+        assert!(parse_url("http://h/a\nX: 1").is_err());
+        assert!(parse_url("http://h/ok?a=1").is_ok());
+    }
+
+    #[test]
+    fn strip_userinfo_removes_credentials() {
+        assert_eq!(crate::backend::strip_userinfo("https://u:p@h/f"), "https://h/f");
+        assert_eq!(crate::backend::strip_userinfo("http://h/f"), "http://h/f");
+        assert_eq!(crate::backend::strip_userinfo("http://h/a@b/c"), "http://h/a@b/c");
     }
 
     #[test]

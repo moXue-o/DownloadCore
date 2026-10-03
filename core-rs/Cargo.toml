@@ -10,8 +10,8 @@ name = "downloadcore"
 crate-type = ["staticlib", "rlib"]
 
 [features]
-# 默认打包"自研网络层"（正式版）：小、依赖少
-default = ["backend-native"]
+# 默认不选任何后端特性 = 自研后端（正式版）；`--features backend-lts` 切大框架版。
+default = []
 backend-native = []
 # 可选打包"大框架网络层"（LTS 版）：稳、全，但体积大
 backend-lts = ["dep:reqwest", "dep:tokio"]

@@ -24,6 +24,8 @@ const SLOW_REMAINING_MIN: i64 = 64 << 10;
 const TAIL_MIN: i64 = 128 << 10;
 /// 段数上限：防止"尾巴切细"把 parts 无限撑大（超大文件时的内存/序列化/O(n²) 保护）
 const MAX_PARTS: usize = 4096;
+/// 预分配上限：超过就不 set_len（防恶意服务器谎报超大 total 造成巨额占盘）
+const MAX_PREALLOC: i64 = 1 << 40; // 1 TiB
 
 /// 进程内"正在下载的目标文件"登记表：防止同一个目标被并发写坏。
 static ACTIVE_TARGETS: std::sync::OnceLock<Lock<HashSet<String>>> = std::sync::OnceLock::new();
@@ -150,7 +152,7 @@ impl Engine {
     fn run(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {
         let limiter = Arc::new(Limiter::new(self.cfg.max_speed));
         let shared = Arc::new(Shared::new(cbs, req.cancel.clone(), req.pause.clone()));
-        *shared.req_url.lock() = req.url.clone();
+        *shared.req_url.lock() = crate::backend::strip_userinfo(&req.url);
         let start = Instant::now();
 
         shared.status(Status::Probing);
@@ -489,7 +491,7 @@ impl Engine {
         temp_dir: &Path,
         marker: &Path,
     ) -> Result<()> {
-        fs::create_dir_all(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
+        create_dir_private(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
 
         if let Some(st) = store::load_state_file(&temp_dir.join(STATE_FILE_NAME)) {
             let has_validator = !pi.etag.is_empty() || !pi.last_modified.is_empty();
@@ -544,7 +546,7 @@ impl Engine {
 
         // 全新开始：清空临时目录，建好输出文件并按总大小预分配
         let _ = fs::remove_dir_all(temp_dir);
-        fs::create_dir_all(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
+        create_dir_private(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
         let _ = fs::remove_file(temp_dir.join(STATE_FILE_NAME)); // remove_dir_all 失败时兜底
         if let Some(parent) = marker.parent() {
             if !parent.as_os_str().is_empty() {
@@ -553,9 +555,14 @@ impl Engine {
         }
         {
             let f = File::create(marker).map_err(|e| fatal("create", format!("创建输出文件失败: {e}")))?;
-            if pi.size > 0 {
+            if pi.size > 0 && pi.size <= MAX_PREALLOC {
                 f.set_len(pi.size as u64)
                     .map_err(|e| fatal("preallocate", format!("预分配失败: {e}")))?;
+            } else if pi.size > MAX_PREALLOC {
+                shared.logf(
+                    "WARN",
+                    format!("声明大小异常大（{} 字节），跳过预分配（改为边下边增长）", pi.size),
+                );
             }
         }
 
@@ -866,8 +873,20 @@ fn move_into_place(src: &Path, final_path: &Path) -> Result<()> {
     fs::rename(src, final_path).map_err(|e| fatal("rename", format!("改名失败: {e}")))
 }
 
-/// 把最终路径归一化成稳定 key：Windows 大小写不敏感 → 统一小写，
-/// 避免同一个文件因大小写不同被当成两个（并发写坏 / 临时目录分裂）。
+/// 把最终路径归一化成稳定 key：Windows 大小写不敏感 → 统一小写，/// 避免同一个文件因大小写不同被当成两个（并发写坏 / 临时目录分裂）。
+/// 建目录（Unix 下权限收紧为 0700，避免临时目录被同机其他用户读写/投毒）。
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 fn target_key(path: &Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let s = abs.display().to_string();

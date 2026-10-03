@@ -80,6 +80,19 @@ pub fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
+/// 去掉网址里的 userinfo（`user:pass@host` → `host`），用于写日志/存续传记录，
+/// 避免把凭据落到磁盘或日志里。（真正请求时也会剥掉它——它本就不用于鉴权。）
+pub fn strip_userinfo(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if let Some(i) = rest.find('@') {
+            if !rest[..i].contains('/') {
+                return format!("{scheme}://{}", &rest[i + 1..]);
+            }
+        }
+    }
+    url.to_string()
+}
+
 /// 从网址里取主机名（去掉协议、userinfo、端口、路径、查询、锚点）。
 pub fn host_of(url: &str) -> Option<String> {
     let (_, rest) = url.split_once("://")?;

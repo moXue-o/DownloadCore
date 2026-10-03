@@ -81,7 +81,18 @@ impl LtsBackend {
         let mut b = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(self.idle_timeout)
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error("too many redirects");
+                }
+                // 拒绝从 HTTPS 降级到 HTTP
+                if let Some(prev) = attempt.previous().last() {
+                    if prev.scheme() == "https" && attempt.url().scheme() == "http" {
+                        return attempt.error("拒绝从 HTTPS 降级到 HTTP");
+                    }
+                }
+                attempt.follow()
+            }))
             .pool_max_idle_per_host(self.max_threads)
             .pool_idle_timeout(Duration::from_secs(POOL_IDLE_SECS))
             .http1_only()
