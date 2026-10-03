@@ -177,8 +177,9 @@ fn redirect_loop_is_rejected() {
     let engine = Engine::new(cfg);
 
     let err = download(&engine, &srv.url_redir(), &out, vec![]).unwrap_err();
-    // 必须报错停下，绝不能无限打转
-    assert!(err.message.contains("跳转"), "应报跳转过多: {}", err.message);
+    // 必须报错停下，绝不能无限打转（两个后端的文案不同，取其一即可）
+    let m = err.message.to_lowercase();
+    assert!(m.contains("跳转") || m.contains("redirect"), "应报跳转过多: {}", err.message);
 }
 
 // ---------------- 安全：跨域跳转要剥掉敏感头 ----------------
