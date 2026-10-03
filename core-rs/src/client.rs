@@ -26,6 +26,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const POOL_IDLE_SECS: u64 = 90;
 /// "跳转后的真实地址"记多久（之后重新解析，避免签名过期）。
 const FINAL_URL_TTL: Duration = Duration::from_secs(300);
+/// 跳转缓存最多多少条；超过就清理过期项/整体清空（防跨大量 URL 无界增长）。
+const MAX_FINAL_CACHE: usize = 256;
 /// 客户端缓存最多多少个来源键；超过就整体清空（防跨大量主机长期运行无界增长）。
 const MAX_CLIENT_KEYS: usize = 64;
 
@@ -167,6 +169,12 @@ impl LtsBackend {
         let final_url = resp.url().as_str();
         if final_url != ep.url {
             let mut m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if m.len() > MAX_FINAL_CACHE {
+                m.retain(|_, (_, t)| t.elapsed() < FINAL_URL_TTL);
+                if m.len() > MAX_FINAL_CACHE {
+                    m.clear();
+                }
+            }
             m.insert(ck, (final_url.to_string(), Instant::now()));
         }
         Ok(resp)
@@ -288,7 +296,8 @@ impl Backend for LtsBackend {
     fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>> {
         let resp = self.get(ep, headers, None)?;
         let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
+        // 204/205 是"无内容"，不能当成功空文件
+        if !(200..300).contains(&status) || status == 204 || status == 205 {
             self.clear_final(&cache_key(&ep.url, ep.ip));
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }

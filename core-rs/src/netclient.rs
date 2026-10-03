@@ -200,7 +200,8 @@ impl NetClient {
     /// 整文件 GET（不带 Range），用于"服务器不支持分段"时的单线程兜底。
     pub fn open_plain(&self, t: &Target, headers: &[(String, String)]) -> Result<Body> {
         let (status, _hdrs, body) = self.request(&t.url, t.ip, headers, None)?;
-        if !(200..300).contains(&status) {
+        // 204/205 是"无内容"，不能当成功空文件
+        if !(200..300).contains(&status) || status == 204 || status == 205 {
             self.clear_final(&cache_key(&t.url, t.ip));
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
@@ -608,6 +609,13 @@ impl Drop for Body {
             return;
         }
         let mut m = pool.lock().unwrap_or_else(|e| e.into_inner());
+        // 键数封顶：跨大量来源长期运行时，防止池键/空闲 socket 无界增长
+        if m.len() > MAX_POOL_KEYS && !m.contains_key(&key) {
+            m.retain(|_, v| {
+                v.retain(|p| p.idle.elapsed() < POOL_IDLE_MAX);
+                !v.is_empty()
+            });
+        }
         let v = m.entry(key).or_default();
         if v.len() < POOL_MAX_IDLE {
             v.push(Pooled { reader, idle: Instant::now() });
@@ -906,26 +914,32 @@ fn split_host_port(authority: &str, https: bool) -> Result<(String, u16)> {
 
     // IPv6：[::1]:8443
     if let Some(after) = authority.strip_prefix('[') {
-        if let Some(close) = after.find(']') {
-            let host = &after[..close];
-            let rest = &after[close + 1..];
-            // 显式端口非法要报错，别静默回退默认端口（与非 IPv6 分支保持一致）
-            let port = match rest.strip_prefix(':') {
-                Some(p) if !p.is_empty() => {
-                    p.parse::<u16>().map_err(|_| fatal("url", format!("端口不合法: {p}")))?
-                }
-                _ => default_port,
-            };
-            return Ok((host.to_string(), port));
-        }
+        let close = after
+            .find(']')
+            .ok_or_else(|| fatal("url", "IPv6 地址缺少 ]"))?;
+        let host = &after[..close];
+        let rest = &after[close + 1..];
+        let port = match rest.strip_prefix(':') {
+            Some(p) if !p.is_empty() => {
+                p.parse::<u16>().map_err(|_| fatal("url", format!("端口不合法: {p}")))?
+            }
+            Some(_) => default_port, // "[::1]:" → 取默认
+            None if rest.is_empty() => default_port,
+            // "[::1]extra" 之类：多余字符必须拒绝，别静默丢弃
+            None => return Err(fatal("url", "IPv6 地址后有多余字符")),
+        };
+        return Ok((host.to_string(), port));
     }
 
     match authority.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+        Some((h, p)) if p.is_empty() => Ok((h.to_string(), default_port)), // "host:"
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
             let port = p.parse().map_err(|_| fatal("url", format!("端口不合法: {p}")))?;
             Ok((h.to_string(), port))
         }
-        _ => Ok((authority.to_string(), default_port)),
+        // 有 ':' 但不是合法端口（如 "host:p80"）→ 报错，别把 "host:p80" 当主机名
+        Some((_, p)) => Err(fatal("url", format!("端口不合法: {p}"))),
+        None => Ok((authority.to_string(), default_port)),
     }
 }
 
@@ -1128,6 +1142,14 @@ mod tests {
         assert_eq!(parse_url("https://[::1]/x").unwrap().port, 443);
         assert!(parse_url("https://[::1]:70000/x").is_err());
         assert!(parse_url("https://[::1]:abc/x").is_err());
+    }
+
+    #[test]
+    fn host_port_validation() {
+        assert!(parse_url("http://host:p80/x").is_err(), "非数字端口应报错");
+        assert_eq!(parse_url("http://host:/x").unwrap().port, 80, "空端口取默认");
+        assert!(parse_url("http://[::1]extra/x").is_err(), "IPv6 后多余字符应拒绝");
+        assert!(parse_url("http://[::1/x").is_err(), "缺 ] 应拒绝");
     }
 
     #[test]

@@ -26,7 +26,7 @@ cargo build --release --lib --features backend-lts   # LTS 版
 
 需要：Rust（rustup 稳定版）；Windows 上还需 MSVC 链接器（Visual Studio Build Tools）。
 
-TLS 走**系统实现**（Windows 下为 Schannel），因此不需要 nasm/cmake，也不依赖 OpenSSL。
+TLS 走**系统实现**：Windows 用 Schannel、macOS 用系统安全框架，均**不需要 nasm/cmake/OpenSSL**；Linux 上 `native-tls` 走 OpenSSL（需要系统 OpenSSL 或开发包）。
 
 ## 测试程序一：Rust 版 `get`（直接用核心）
 

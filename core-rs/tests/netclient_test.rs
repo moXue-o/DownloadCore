@@ -164,6 +164,14 @@ fn too_many_interim_responses_errors() {
 }
 
 #[test]
+fn no_content_status_is_rejected() {
+    let url = raw_server(|s| {
+        let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+    });
+    assert!(client().open_plain(&Target::new(url), &[]).is_err(), "204 应被拒绝");
+}
+
+#[test]
 fn chunked_empty_line_flood_errors() {
     let url = raw_server(|s| {
         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
