@@ -67,6 +67,10 @@ fn error_code(e: &crate::errors::Error) -> c_int {
     if e.message.starts_with(ERR_TOO_MANY_FAILURES) {
         return DC_ERR_RETRY_EXHAUSTED;
     }
+    // 构造/URL 错误（reqwest 会把它们包成 "send: builder error for url ..."）→ 参数无效
+    if e.message.contains("builder error") || e.message.contains("invalid URL") {
+        return DC_ERR_INVALID;
+    }
     match e.op {
         "write" | "open" | "create" | "mkdir" | "assemble" | "rename" | "preallocate" | "seek" => {
             DC_ERR_IO
@@ -558,5 +562,10 @@ mod layout_tests {
         assert_eq!(error_code(&fatal("busy", "目标文件正在被另一个下载任务使用")), DC_ERR_TARGET_BUSY);
         assert_eq!(error_code(&fatal("write", "x")), DC_ERR_IO);
         assert_eq!(error_code(&retryable("connect", "x")), DC_ERR_HTTP);
+        // LTS 会把非法 URL 包成 send: builder error → 仍要判 INVALID
+        assert_eq!(
+            error_code(&retryable("send", "builder error for url (ftp://x/f)")),
+            DC_ERR_INVALID
+        );
     }
 }
