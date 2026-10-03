@@ -267,7 +267,7 @@ impl Engine {
                 return Err(fatal("whole", "实际下载字节数与声明大小不符（可能被截断）"));
             }
             shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
-            if let Err(e) = self.verify_checksum(&shared, &marker, &req.expected_sha256) {
+            if let Err(e) = self.verify_checksum(&shared, &marker, &temp_dir, &req.expected_sha256) {
                 shared.status(Status::Failed);
                 return Err(e);
             }
@@ -465,7 +465,7 @@ impl Engine {
         // 全部下完 → 直接把 .part 改名成正式文件（无拼装）
         let n_segments = { shared.parts.lock().len() };
         shared.status(Status::Assembling);
-        if let Err(e) = self.verify_checksum(&shared, &marker, &req.expected_sha256) {
+        if let Err(e) = self.verify_checksum(&shared, &marker, &temp_dir, &req.expected_sha256) {
             shared.status(Status::Failed);
             return Err(e);
         }
@@ -537,6 +537,7 @@ impl Engine {
         &self,
         shared: &Arc<Shared>,
         marker: &Path,
+        temp_dir: &Path,
         expected: &Option<String>,
     ) -> Result<()> {
         let Some(exp) = expected else { return Ok(()) };
@@ -548,6 +549,8 @@ impl Engine {
             .map_err(|e| fatal("checksum", format!("计算校验和失败: {e}")))?;
         if !got.eq_ignore_ascii_case(exp) {
             shared.logf("ERROR", format!("校验和不符：期望 {exp}，实际 {got}"));
+            // 清掉续传状态：下次重新完整下载，而不是复用"已知坏"的字节
+            let _ = fs::remove_dir_all(temp_dir);
             return Err(fatal("checksum", format!("校验和不符：期望 {exp}，实际 {got}")));
         }
         shared.logf("INFO", format!("校验和通过：{got}"));
@@ -564,7 +567,9 @@ impl Engine {
         create_dir_private(temp_dir).map_err(|e| fatal("mkdir", format!("创建临时目录失败: {e}")))?;
 
         if let Some(st) = store::load_state_file(&temp_dir.join(STATE_FILE_NAME)) {
-            let has_validator = !pi.etag.is_empty() || !pi.last_modified.is_empty();
+            // 有身份证（强 ETag 或 Last-Modified）才信任续传
+            let has_validator = !crate::backend::strong_etag(&pi.etag).is_empty()
+                || !pi.last_modified.is_empty();
             // 输出文件长度校验：预分配过就要求满长；超大文件（跳过预分配）只要求不超过声明长
             let marker_len = marker.metadata().map(|m| m.len()).unwrap_or(0);
             let marker_len_ok = if pi.size <= MAX_PREALLOC {
@@ -1179,15 +1184,13 @@ fn download_part_once(
         // 每次（重）连接都轮换一个来源：多 IP / 镜像之间轮转
         let (be, ep, src_idx) = shared.pick_source();
         let mut headers = shared.headers_for(&ep.url);
-        // 带身份证：内容若在下载期间变了/多来源不一致，服务器会改回 200，我们据此报错而不是拼错
-        if let Some(v) = shared.if_range_value() {
+        // 用"这个来源自己"的验证器发 If-Range
+        if let Some(v) = crate::backend::if_range_value(&ep.etag, &ep.last_modified) {
             headers.push(("If-Range".to_string(), v));
         }
-        // 复核期望：总长 + 验证器
-        let (etag, last_mod) = { (shared.etag.lock().clone(), shared.last_mod.lock().clone()) };
         let expect = crate::backend::RangeCheck {
-            etag: &etag,
-            last_modified: &last_mod,
+            etag: &ep.etag,
+            last_modified: &ep.last_modified,
             total: shared.total.load(Ordering::SeqCst),
         };
         let body = match be.open_range(&ep, &headers, current, to, &expect) {

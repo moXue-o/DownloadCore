@@ -204,13 +204,12 @@ impl NetClient {
         }
         let re = header_get(&hdrs, "etag");
         let rl = header_get(&hdrs, "last-modified");
-        // 与 same_file 同口径："强 ETag 或 Last-Modified 任一匹配"即可；两个都比对且都不匹配才报错
-        let etag_match = !expect.etag.is_empty() && !re.is_empty() && re.eq_ignore_ascii_case(expect.etag);
-        let lm_match =
-            !expect.last_modified.is_empty() && !rl.is_empty() && rl == expect.last_modified;
-        let etag_mismatch = !expect.etag.is_empty() && !re.is_empty() && !etag_match;
-        let lm_mismatch = !expect.last_modified.is_empty() && !rl.is_empty() && !lm_match;
-        if (etag_mismatch || lm_mismatch) && !(etag_match || lm_match) {
+        // 强 ETag 优先且排他；响应带了验证器就必须与期望相容（堵"中途换内容/换来源"）
+        let expect_has = !expect.etag.is_empty() || !expect.last_modified.is_empty();
+        if expect_has
+            && (!re.is_empty() || !rl.is_empty())
+            && !crate::backend::validators_compatible(expect.etag, expect.last_modified, re, rl)
+        {
             self.clear_final(&cache_key(&t.url, t.ip));
             return Err(retryable(
                 "range",
@@ -410,11 +409,14 @@ impl NetClient {
         }
         let mut m = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         // 池子键数封顶：跨大量主机长期运行时，防止连接/fd 无界增长
-        if m.len() > MAX_POOL_KEYS && !m.contains_key(key) {
+        if m.len() >= MAX_POOL_KEYS && !m.contains_key(key) {
             m.retain(|_, v| {
                 v.retain(|p| p.idle.elapsed() < POOL_IDLE_MAX);
                 !v.is_empty()
             });
+            if m.len() >= MAX_POOL_KEYS {
+                m.clear(); // 都新鲜时兜底清空，保证是硬上限
+            }
         }
         let v = m.entry(key.to_string()).or_default();
         if v.len() < POOL_MAX_IDLE {
@@ -633,11 +635,14 @@ impl Drop for Body {
         }
         let mut m = pool.lock().unwrap_or_else(|e| e.into_inner());
         // 键数封顶：跨大量来源长期运行时，防止池键/空闲 socket 无界增长
-        if m.len() > MAX_POOL_KEYS && !m.contains_key(&key) {
+        if m.len() >= MAX_POOL_KEYS && !m.contains_key(&key) {
             m.retain(|_, v| {
                 v.retain(|p| p.idle.elapsed() < POOL_IDLE_MAX);
                 !v.is_empty()
             });
+            if m.len() >= MAX_POOL_KEYS {
+                m.clear(); // 都新鲜时兜底清空，保证是硬上限
+            }
         }
         let v = m.entry(key).or_default();
         if v.len() < POOL_MAX_IDLE {

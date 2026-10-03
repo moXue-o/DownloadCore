@@ -23,12 +23,15 @@ pub struct ProbeInfo {
     pub file_name: String,
 }
 
-/// 一个下载来源：网址 +（可选）绑定到某个 IP + 日志标签。
+/// 一个下载来源：网址 +（可选）绑定到某个 IP + 日志标签 + 探路得到的验证器。
 #[derive(Clone, Debug)]
 pub struct Endpoint {
     pub url: String,
     pub ip: Option<IpAddr>,
     pub label: String,
+    /// 该来源探路得到的验证器（用于给"这个来源"发 If-Range 与逐段复核）
+    pub etag: String,
+    pub last_modified: String,
 }
 
 /// 分段请求的"期望值"：用于在收到 206 后复核服务器给的验证器/总长（堵"中途换内容/换来源"）。
@@ -168,16 +171,28 @@ fn sources_for(cfg: &Config, url: &str) -> Vec<Endpoint> {
             if ips.len() > 1 {
                 return ips
                     .into_iter()
-                    .map(|ip| Endpoint { url: url.to_string(), ip: Some(ip), label: ip.to_string() })
+                    .map(|ip| Endpoint {
+                        url: url.to_string(),
+                        ip: Some(ip),
+                        label: ip.to_string(),
+                        etag: String::new(),
+                        last_modified: String::new(),
+                    })
                     .collect();
             }
         }
     }
-    vec![Endpoint { url: url.to_string(), ip: None, label: "default".to_string() }]
+    vec![Endpoint {
+        url: url.to_string(),
+        ip: None,
+        label: "default".to_string(),
+        etag: String::new(),
+        last_modified: String::new(),
+    }]
 }
 
 /// 弱 ETag（`W/"..."`）不能当强校验器用：这里把它视为"没有 ETag"。
-fn strong_etag(e: &str) -> &str {
+pub fn strong_etag(e: &str) -> &str {
     if e.trim_start().starts_with("W/") {
         ""
     } else {
@@ -185,20 +200,52 @@ fn strong_etag(e: &str) -> &str {
     }
 }
 
-/// 两个来源算不算"同一个文件"：大小、分段支持一致，且**至少有一个身份证（强 ETag 或
-/// Last-Modified）非空并相等**。没有身份证就只比大小太危险（同大小不同内容会拼坏文件）。
+/// 两个验证器组是否"相容"（同一文件）：**强 ETag 优先且排他**；否则比原始 ETag；
+/// 再否则比 Last-Modified。没有任何共同可比项 → false（不认）。
+pub fn validators_compatible(
+    a_etag: &str,
+    a_lm: &str,
+    b_etag: &str,
+    b_lm: &str,
+) -> bool {
+    let (sa, sb) = (strong_etag(a_etag), strong_etag(b_etag));
+    if !sa.is_empty() && !sb.is_empty() {
+        return sa == sb; // 强 ETag 不匹配即不同，不再看 Last-Modified
+    }
+    if !a_etag.is_empty() && !b_etag.is_empty() {
+        return a_etag == b_etag; // ETag 是 opaque，大小写敏感
+    }
+    if !a_lm.is_empty() && !b_lm.is_empty() {
+        return a_lm == b_lm;
+    }
+    false
+}
+
+/// 给某个来源发 If-Range 时用的值（优先强 ETag，其次 Last-Modified；弱 ETag 不用）。
+pub fn if_range_value(etag: &str, last_modified: &str) -> Option<String> {
+    let s = strong_etag(etag);
+    if !s.is_empty() {
+        return Some(s.to_string());
+    }
+    if !last_modified.is_empty() {
+        return Some(last_modified.to_string());
+    }
+    None
+}
+
+/// 两个来源算不算"同一个文件"：大小、分段支持一致，且验证器相容。
 fn same_file(a: &ProbeInfo, b: &ProbeInfo) -> bool {
     if a.size != b.size || a.range_ok != b.range_ok {
         return false;
     }
-    let (ea, eb) = (strong_etag(&a.etag), strong_etag(&b.etag));
-    if !ea.is_empty() && !eb.is_empty() {
-        return ea == eb;
-    }
-    if !a.last_modified.is_empty() && !b.last_modified.is_empty() {
-        return a.last_modified == b.last_modified;
-    }
-    false
+    validators_compatible(&a.etag, &a.last_modified, &b.etag, &b.last_modified)
+}
+
+fn with_validator(ep: &Endpoint, pi: &ProbeInfo) -> Endpoint {
+    let mut e = ep.clone();
+    e.etag = pi.etag.clone();
+    e.last_modified = pi.last_modified.clone();
+    e
 }
 
 /// 建来源池并探路。镜像只有"与主源是同一文件"才被采纳。
@@ -228,11 +275,12 @@ pub fn build_pool(
             match be.probe(ep, headers) {
                 Ok(pi) => {
                     if info.is_none() {
+                        let e2 = with_validator(ep, &pi);
+                        healthy.push(e2); // 第一个成功来源
                         info = Some(pi);
-                        healthy.push(ep.clone()); // 第一个成功来源
                     } else if same_file(info.as_ref().unwrap(), &pi) {
                         // 其余 IP 也必须确认是"同一份文件"才采纳，否则不混拼
-                        healthy.push(ep.clone());
+                        healthy.push(with_validator(ep, &pi));
                     }
                 }
                 Err(e) => last_err = Some(e),
@@ -283,13 +331,14 @@ pub fn build_pool(
                     None => {
                         // 先确认镜像与主源是同一文件，再作为该镜像的基准
                         if same_file(&info, &pi) {
+                            let e2 = with_validator(ep, &pi);
                             mirror_info = Some(pi);
-                            ok_mirror.push(ep.clone());
+                            ok_mirror.push(e2);
                         }
                     }
                     Some(base) => {
                         if same_file(base, &pi) {
-                            ok_mirror.push(ep.clone());
+                            ok_mirror.push(with_validator(ep, &pi));
                         }
                     }
                 }
@@ -323,11 +372,14 @@ mod tests {
         assert!(!same_file(&pi(10, "", ""), &pi(10, "", "")), "无身份证不认");
         assert!(same_file(&pi(10, "\"a\"", ""), &pi(10, "\"a\"", "")));
         assert!(!same_file(&pi(10, "\"a\"", ""), &pi(10, "\"b\"", "")));
-        // 弱 ETag 不算身份
-        assert!(!same_file(&pi(10, "W/\"a\"", ""), &pi(10, "W/\"a\"", "")));
+        // 强 ETag 优先且排他：强 ETag 不同 → 不认（即使 Last-Modified 相同）
+        assert!(!same_file(&pi(10, "\"a\"", "x"), &pi(10, "\"b\"", "x")));
+        // 弱 ETag：相同 → 相容；不同 → 即使 Last-Modified 相同也不认
+        assert!(same_file(&pi(10, "W/\"a\"", ""), &pi(10, "W/\"a\"", "")));
+        assert!(!same_file(&pi(10, "W/\"a\"", "x"), &pi(10, "W/\"b\"", "x")));
         // 强 ETag 匹配即可（Last-Modified 不同也认）
         assert!(same_file(&pi(10, "\"a\"", "x"), &pi(10, "\"a\"", "y")));
-        // 无强 ETag 时用 Last-Modified
+        // 无 ETag 时用 Last-Modified
         assert!(same_file(&pi(10, "", "x"), &pi(10, "", "x")));
         assert!(!same_file(&pi(10, "", "x"), &pi(10, "", "y")));
     }

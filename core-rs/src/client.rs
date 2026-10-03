@@ -303,13 +303,12 @@ impl Backend for LtsBackend {
         }
         let re = header_str(&resp, "etag");
         let rl = header_str(&resp, "last-modified");
-        // 与 same_file 同口径："强 ETag 或 Last-Modified 任一匹配"即可
-        let etag_match = !expect.etag.is_empty() && !re.is_empty() && re.eq_ignore_ascii_case(expect.etag);
-        let lm_match =
-            !expect.last_modified.is_empty() && !rl.is_empty() && rl == expect.last_modified;
-        let etag_mismatch = !expect.etag.is_empty() && !re.is_empty() && !etag_match;
-        let lm_mismatch = !expect.last_modified.is_empty() && !rl.is_empty() && !lm_match;
-        if (etag_mismatch || lm_mismatch) && !(etag_match || lm_match) {
+        // 强 ETag 优先且排他；响应带了验证器就必须与期望相容
+        let expect_has = !expect.etag.is_empty() || !expect.last_modified.is_empty();
+        if expect_has
+            && (!re.is_empty() || !rl.is_empty())
+            && !crate::backend::validators_compatible(expect.etag, expect.last_modified, &re, &rl)
+        {
             self.clear_final(&cache_key(&ep.url, ep.ip));
             return Err(retryable(
                 "range",
