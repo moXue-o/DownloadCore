@@ -303,3 +303,32 @@ pub fn build_pool(
     }
     Ok((eps, info))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pi(size: i64, etag: &str, lm: &str) -> ProbeInfo {
+        ProbeInfo {
+            size,
+            range_ok: true,
+            etag: etag.to_string(),
+            last_modified: lm.to_string(),
+            file_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn same_file_requires_validator() {
+        assert!(!same_file(&pi(10, "", ""), &pi(10, "", "")), "无身份证不认");
+        assert!(same_file(&pi(10, "\"a\"", ""), &pi(10, "\"a\"", "")));
+        assert!(!same_file(&pi(10, "\"a\"", ""), &pi(10, "\"b\"", "")));
+        // 弱 ETag 不算身份
+        assert!(!same_file(&pi(10, "W/\"a\"", ""), &pi(10, "W/\"a\"", "")));
+        // 强 ETag 匹配即可（Last-Modified 不同也认）
+        assert!(same_file(&pi(10, "\"a\"", "x"), &pi(10, "\"a\"", "y")));
+        // 无强 ETag 时用 Last-Modified
+        assert!(same_file(&pi(10, "", "x"), &pi(10, "", "x")));
+        assert!(!same_file(&pi(10, "", "x"), &pi(10, "", "y")));
+    }
+}

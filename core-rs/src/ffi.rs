@@ -572,4 +572,103 @@ mod layout_tests {
             DC_ERR_INVALID
         );
     }
+
+    #[test]
+    fn dc_engine_download_end_to_end() {
+        use std::ffi::CStr;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        // 极简本地服务器（支持 Range）
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                if let Ok(mut s) = s {
+                    std::thread::spawn(move || {
+                        let mut r = BufReader::new(s.try_clone().unwrap());
+                        let mut range: Option<(i64, i64)> = None;
+                        loop {
+                            let mut l = String::new();
+                            if r.read_line(&mut l).unwrap() == 0 || l == "\r\n" {
+                                break;
+                            }
+                            let low = l.to_ascii_lowercase();
+                            if let Some(rest) = low.strip_prefix("range:") {
+                                let spec = rest.trim().strip_prefix("bytes=").unwrap_or("");
+                                if let Some((a, b)) = spec.split_once('-') {
+                                    let a: i64 = a.parse().unwrap_or(0);
+                                    let b: i64 = if b.is_empty() {
+                                        999_999
+                                    } else {
+                                        b.parse().unwrap_or(0)
+                                    };
+                                    range = Some((a, b));
+                                }
+                            }
+                        }
+                        let total: i64 = 1_000_000;
+                        let body: Vec<u8> = match range {
+                            Some((a, b)) => {
+                                let b = b.min(total - 1);
+                                let head = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {a}-{b}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    b - a + 1
+                                );
+                                let _ = s.write_all(head.as_bytes());
+                                (a..=b).map(|i| (i & 0xff) as u8).collect()
+                            }
+                            None => {
+                                let head = format!(
+                                    "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                                );
+                                let _ = s.write_all(head.as_bytes());
+                                (0..total).map(|i| (i & 0xff) as u8).collect()
+                            }
+                        };
+                        let _ = s.write_all(&body);
+                    });
+                }
+            }
+        });
+
+        let url = format!("http://{addr}/f.bin");
+        let dir = std::env::temp_dir().join(format!("dcdemo-ffi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c_url = std::ffi::CString::new(url).unwrap();
+        let c_dir = std::ffi::CString::new(dir.display().to_string()).unwrap();
+        let mut req: dc_request = unsafe { std::mem::zeroed() };
+        req.url = c_url.as_ptr();
+        req.target_dir = c_dir.as_ptr();
+
+        let e = unsafe { dc_engine_new(std::ptr::null()) };
+        assert!(!e.is_null());
+        let mut out: dc_result = unsafe { std::mem::zeroed() };
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            dc_engine_download(
+                e,
+                &req,
+                None,
+                None,
+                None,
+                std::ptr::null_mut(),
+                &mut out,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, DC_OK, "FFI 下载失败");
+        assert_eq!(out.size, 1_000_000);
+        assert!(!out.path.is_null());
+        let path = unsafe { CStr::from_ptr(out.path) }.to_string_lossy().to_string();
+        let got = std::fs::read(&path).unwrap();
+        let expect: Vec<u8> = (0..1_000_000).map(|i| (i & 0xff) as u8).collect();
+        assert_eq!(got, expect, "FFI 下载内容不一致");
+
+        unsafe {
+            dc_result_free(&mut out);
+            dc_engine_free(e);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

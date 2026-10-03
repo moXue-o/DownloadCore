@@ -194,18 +194,24 @@ fn no_content_status_is_rejected() {
 
 #[test]
 fn chunked_empty_line_flood_errors() {
+    use std::time::{Duration, Instant};
+    // 服务器"保持连接、持续发空行"约 2s；客户端必须在服务器还没发完时就因上限报错
     let url = raw_server(|s| {
         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
-        for _ in 0..1_000_000 {
+        let _ = s.flush();
+        for _ in 0..2000 {
             if s.write_all(b"\r\n").is_err() {
                 break;
             }
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_millis(1));
         }
     });
     let mut body = client().open_plain(&Target::new(url), &[]).unwrap();
     let mut buf = [0u8; 1024];
+    let t0 = Instant::now();
     let mut errored = false;
-    for _ in 0..1000 {
+    for _ in 0..100000 {
         match body.read(&mut buf) {
             Ok(0) => break,
             Ok(_) => {}
@@ -215,7 +221,12 @@ fn chunked_empty_line_flood_errors() {
             }
         }
     }
-    assert!(errored, "空行洪泛应报错而不是一直读");
+    assert!(errored, "空行洪泛应报错");
+    assert!(
+        t0.elapsed() < Duration::from_millis(800),
+        "应在服务器仍在发送时就因上限报错（否则上限形同虚设），实际 {:?}",
+        t0.elapsed()
+    );
 }
 
 #[test]

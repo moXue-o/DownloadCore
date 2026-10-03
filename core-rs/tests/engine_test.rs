@@ -287,5 +287,5 @@ fn mirrors_are_used() {
         )
         .unwrap();
     assert_eq!(read_file(&res.path), data);
-    assert!(fast.hits() > 0, "镜像应当被用到");
+    assert!(fast.hits() > 1, "镜像应当真正被用于下载（不只是探路），hits={}", fast.hits());
 }

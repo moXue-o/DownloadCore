@@ -1181,4 +1181,19 @@ mod tests {
         let c = NetClient::new("ua", Duration::ZERO);
         assert!(!c.idle_timeout.is_zero());
     }
+
+    #[test]
+    fn build_request_strips_crlf_in_headers_and_ua() {
+        let u = parse_url("http://h/x").unwrap();
+        let out = build_request(
+            &u,
+            "UA\r\nX-Evil-UA: 1",
+            &[("X-H".to_string(), "v\r\nX-Evil: 2".to_string())],
+            None,
+        );
+        // 不能凭 CR/LF 造出新的头行
+        assert!(!out.contains("\r\nX-Evil-UA:"), "UA 注入未被拦: {out:?}");
+        assert!(!out.contains("\r\nX-Evil:"), "自定义头注入未被拦: {out:?}");
+        assert!(out.contains("User-Agent: UAX-Evil-UA: 1"));
+    }
 }

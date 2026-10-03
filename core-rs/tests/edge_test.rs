@@ -48,7 +48,7 @@ fn required_header_missing_fails() {
 
     // 没带 token，探路就该被 403 挡下
     let err = download(&engine, &srv.url(), &out, vec![]).unwrap_err();
-    assert!(!err.message.is_empty());
+    assert_eq!(err.kind, downloadcore::ErrorKind::Fatal, "403 探路应致命失败: {err:?}");
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn redirect_loop_is_rejected() {
 
     let err = download(&engine, &srv.url_redir(), &out, vec![]).unwrap_err();
     // 必须报错停下，绝不能无限打转
-    assert!(!err.message.is_empty());
+    assert!(err.message.contains("跳转"), "应报跳转过多: {}", err.message);
 }
 
 // ---------------- 安全：跨域跳转要剥掉敏感头 ----------------
@@ -339,7 +339,7 @@ fn if_range_mismatch_fails_loudly() {
 
     // 必须干净失败：绝不把"拼错的字节"当成功产出正式文件
     let err = download(&engine, &srv.url(), &out, vec![]).unwrap_err();
-    assert!(!err.message.is_empty());
+    assert_eq!(err.kind, downloadcore::ErrorKind::Fatal, "应当致命失败: {err:?}");
     assert!(!out.exists(), "失败时不应留下正式文件");
 }
 

@@ -1355,3 +1355,34 @@ fn open_output_file(marker: &Path) -> Result<File> {
         .open(marker)
         .map_err(|e| fatal("open", format!("打开输出文件失败: {e}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parts_cover_rejects_gap_overlap_out_of_range() {
+        let ok = vec![
+            PartState { from: 0, to: 9, current: 10 },
+            PartState { from: 10, to: 19, current: 20 },
+        ];
+        assert!(parts_cover(&ok, 20));
+        // 缺口
+        let gap = vec![
+            PartState { from: 0, to: 9, current: 10 },
+            PartState { from: 11, to: 19, current: 20 },
+        ];
+        assert!(!parts_cover(&gap, 20));
+        // 重叠
+        let overlap = vec![
+            PartState { from: 0, to: 9, current: 10 },
+            PartState { from: 9, to: 19, current: 20 },
+        ];
+        assert!(!parts_cover(&overlap, 20));
+        // 越界
+        assert!(!parts_cover(&[PartState { from: 0, to: 20, current: 21 }], 20));
+        // 空 / 非法 size
+        assert!(!parts_cover(&[], 20));
+        assert!(!parts_cover(&ok, 0));
+    }
+}

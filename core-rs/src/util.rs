@@ -331,6 +331,15 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_name_blocks_traversal() {
+        assert_eq!(sanitize_name("../evil"), "evil");
+        assert_eq!(sanitize_name("a/b/c"), "c");
+        assert_eq!(sanitize_name("bad:name?.txt"), "bad_name_.txt");
+        assert_eq!(sanitize_name("   "), "download.bin");
+        assert_eq!(sanitize_name("."), "download.bin");
+    }
+
+    #[test]
     fn sha256_known_vectors() {
         let h = |s: &str| {
             let mut x = Sha256::new();
