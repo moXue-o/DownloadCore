@@ -243,26 +243,32 @@ pub fn build_pool(
         } else {
             redact_sensitive(headers)
         };
-        // 逐个探，保留健康来源，并确认是同一文件
+        // 逐个探，保留健康来源；**每个都要确认是同一文件**才纳入
         let tmp = sources_for(cfg, m);
         let mut ok_mirror: Vec<Endpoint> = Vec::new();
-        let mut first_pi: Option<ProbeInfo> = None;
+        let mut mirror_info: Option<ProbeInfo> = None;
         for ep in tmp.iter() {
             if canceled() {
                 return Err(Error::canceled());
             }
             if let Ok(pi) = be.probe(ep, &m_headers) {
-                if first_pi.is_none() {
-                    first_pi = Some(pi);
+                match &mirror_info {
+                    None => {
+                        // 先确认镜像与主源是同一文件，再作为该镜像的基准
+                        if same_file(&info, &pi) {
+                            mirror_info = Some(pi);
+                            ok_mirror.push(ep.clone());
+                        }
+                    }
+                    Some(base) => {
+                        if same_file(base, &pi) {
+                            ok_mirror.push(ep.clone());
+                        }
+                    }
                 }
-                ok_mirror.push(ep.clone());
             }
         }
-        if let Some(pi) = first_pi {
-            if same_file(&info, &pi) {
-                eps.extend(ok_mirror);
-            }
-        }
+        eps.extend(ok_mirror);
     }
     Ok((eps, info))
 }
