@@ -31,7 +31,7 @@ typedef enum dc_status {
     DC_STATUS_PENDING = 0,
     DC_STATUS_PROBING = 1,
     DC_STATUS_DOWNLOADING = 2,
-    DC_STATUS_ASSEMBLING = 3,
+    DC_STATUS_ASSEMBLING = 3,   /* 收尾（把 .part 改名成正式文件） */
     DC_STATUS_COMPLETED = 4,
     DC_STATUS_FAILED = 5,
     DC_STATUS_CANCELED = 6
@@ -77,7 +77,7 @@ typedef struct dc_progress {
 typedef struct dc_config {
     int      initial_threads;   /* 开局工人数；<=0 用默认 */
     int      max_threads;       /* 最多工人数；<=0 用默认 */
-    int64_t  min_part_size;     /* 最小分段；<=0 用默认 */
+    int64_t  min_part_size;     /* 分段粒度（目标；实际单段可能略小）；<=0 用默认 */
     int      buffer_size;       /* 读写缓冲；<=0 用默认 */
     int      idle_timeout_ms;   /* 空闲超时（毫秒）；<=0 用默认 */
     int      max_retries;       /* 每段最大重试；<0 用默认 */
@@ -127,6 +127,7 @@ void dc_engine_resume(dc_engine* engine);
  * 同步下载。返回 0 成功；非 0 为 dc_error 错误码（*err_msg 为错误信息，需 dc_string_free）。
  * 结果写入 *out（可为 NULL），其中 path 需 dc_result_free 释放。
  * 回调函数指针可为 NULL（表示不关心）。
+ * err_msg 必须非 NULL（本函数会把 *err_msg 置空/填入错误信息）；传 NULL 直接返回 DC_ERR_INVALID。
  */
 int dc_engine_download(dc_engine* engine,
                        const dc_request* req,

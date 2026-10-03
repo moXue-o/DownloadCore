@@ -14,7 +14,7 @@ pub struct Config {
     pub initial_threads: usize,
     /// 动态分段最多能加到几个工人
     pub max_threads: usize,
-    /// 最小分段大小；小于它就不再切
+    /// 分段粒度（目标）；实际单段可能略小（分裂是"对半切"），收尾阶段可更细
     pub min_part_size: i64,
     /// 每个工人的读写缓冲
     pub buffer_size: usize,

@@ -187,23 +187,29 @@ pub fn build_pool(
     headers: &[(String, String)],
     canceled: &dyn Fn() -> bool,
 ) -> Result<(Vec<Endpoint>, ProbeInfo)> {
-    let mut eps = sources_for(cfg, primary);
-
+    let eps = sources_for(cfg, primary);
     let rounds = cfg.max_retries.clamp(1, 3);
+    let mut healthy: Vec<Endpoint> = Vec::new();
     let mut info: Option<ProbeInfo> = None;
     let mut last_err = None;
     'outer: for r in 0..rounds {
+        healthy.clear();
         for ep in eps.iter() {
             if canceled() {
                 return Err(Error::canceled());
             }
             match be.probe(ep, headers) {
                 Ok(pi) => {
-                    info = Some(pi);
-                    break 'outer;
+                    if info.is_none() {
+                        info = Some(pi);
+                    }
+                    healthy.push(ep.clone()); // 只保留"探得通"的来源（剔除死 IP）
                 }
                 Err(e) => last_err = Some(e),
             }
+        }
+        if info.is_some() {
+            break 'outer;
         }
         if r + 1 < rounds {
             if canceled() {
@@ -218,6 +224,8 @@ pub fn build_pool(
             return Err(last_err.unwrap_or_else(|| retryable("probe", "探路失败：所有来源都不通")))
         }
     };
+    // 只保留探得通的来源；万一个都没记下（不该发生），退回未绑定来源
+    let mut eps = if healthy.is_empty() { sources_for(cfg, primary) } else { healthy };
 
     for m in mirrors {
         if m.trim().is_empty() {
@@ -226,16 +234,31 @@ pub fn build_pool(
         if canceled() {
             return Err(Error::canceled());
         }
-        // 先用单个来源探路，确认是同一文件再纳入（并展开多 IP）
+        // 跨域镜像：别把 Authorization/Cookie 发过去
         let m_headers: Vec<(String, String)> = if same_origin(primary, m) {
             headers.to_vec()
         } else {
-            redact_sensitive(headers) // 跨域镜像：别把 Authorization/Cookie 发过去
+            redact_sensitive(headers)
         };
+        // 逐个探，保留健康来源，并确认是同一文件
         let tmp = sources_for(cfg, m);
-        match be.probe(&tmp[0], &m_headers) {
-            Ok(pi) if same_file(&info, &pi) => eps.extend(tmp),
-            _ => {}
+        let mut ok_mirror: Vec<Endpoint> = Vec::new();
+        let mut first_pi: Option<ProbeInfo> = None;
+        for ep in tmp.iter() {
+            if canceled() {
+                return Err(Error::canceled());
+            }
+            if let Ok(pi) = be.probe(ep, &m_headers) {
+                if first_pi.is_none() {
+                    first_pi = Some(pi);
+                }
+                ok_mirror.push(ep.clone());
+            }
+        }
+        if let Some(pi) = first_pi {
+            if same_file(&info, &pi) {
+                eps.extend(ok_mirror);
+            }
         }
     }
     Ok((eps, info))

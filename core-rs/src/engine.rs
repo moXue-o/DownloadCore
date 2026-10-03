@@ -155,6 +155,7 @@ impl Engine {
         *shared.req_url.lock() = crate::backend::strip_userinfo(&req.url);
         let start = Instant::now();
 
+        shared.status(Status::Pending);
         shared.status(Status::Probing);
         // 建来源池（主地址 + 镜像/多 IP）并探路
         // 探路用的头：先剥掉用户的 Accept-Encoding（我们只发 identity；LTS 探路也走这里）
@@ -191,9 +192,10 @@ impl Engine {
         let _ = shared.endpoints.set(eps);
         let _ = shared.backend.set(self.backend.clone());
         let _ = shared.headers.set(req.headers.clone());
+        let src_desc = if n_src > 1 { "主地址 + 镜像/多 IP" } else { "单一来源" };
         shared.logf(
             "INFO",
-            format!("下载来源：{n_src} 个（主地址 + 镜像/多 IP；网络后端={}）", self.backend.name()),
+            format!("下载来源：{n_src} 个（{src_desc}；网络后端={}）", self.backend.name()),
         );
         let size = pi.size.max(0);
         shared.total.store(size, Ordering::SeqCst);
@@ -261,6 +263,16 @@ impl Engine {
                 shared.status(Status::Failed);
                 return Err(e);
             }
+            // 整文件分支也补一条 100% 进度，和分段分支保持一致
+            if let Some(cb) = &shared.cbs.on_progress {
+                let total = if size > 0 { size } else { got };
+                cb(Progress {
+                    downloaded: got,
+                    total,
+                    speed: speed_of(shared.session_bytes.load(Ordering::SeqCst), start.elapsed()),
+                    parts: 0,
+                });
+            }
             shared.status(Status::Completed);
             return Ok(DownloadResult {
                 path: final_path.display().to_string(),
@@ -274,7 +286,7 @@ impl Engine {
         shared.logf(
             "INFO",
             format!(
-                "模式：分段下载（开局 {} 路，最多 {} 路，最小段 {} 字节）",
+                "模式：分段下载（开局 {} 路，最多 {} 路，目标段 {} 字节）",
                 self.cfg.initial_threads, self.cfg.max_threads, self.cfg.min_part_size
             ),
         );

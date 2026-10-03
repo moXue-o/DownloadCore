@@ -67,6 +67,7 @@ cargo run --bin get -- -v         # 只看版本
 | `tests/common/mod.rs` | 可摆布的测试服务器（分段/不分段/分块/跳转/卡住/限速） |
 | `tests/engine_test.rs` | 引擎端到端测试 |
 | `tests/netclient_test.rs` | 自研网络层独立测试 |
+| `tests/edge_test.rs` | 边角测试（自定义头、跳转、并发互斥、续传、If-Range 等） |
 
 ## 已实现（对应 Go 验证版）
 
@@ -83,7 +84,7 @@ cargo run --bin get -- -v         # 只看版本
 - **自适应并发**（可选，默认关）：只增不减地"爬坡"到 max（不做速度反馈，不会抖动）；关则固定用 max。像 AB 那样固定并发也完全可用
 - 暂停 / 恢复 / 取消（可从别的线程调用）
 
-测试：5 个单元测试 + 9 个引擎端到端测试 + 10 个自研网络层测试，全部通过；两种后端各跑一遍。
+测试：**19 个单元测试**（LTS 下 20）+ **9 个引擎端到端** + **14 个网络层** + **22 个边角**（`edge_test.rs`），全部通过；两种后端各跑一遍。
 
 ## 设计要点
 
@@ -130,7 +131,7 @@ dc_engine_free(e);
 
 ```bash
 cd core-rs
-cargo build --release --lib
+cargo build --release --lib --bin serve   # 库 + 本地测试服务器（serve）
 cd cdemo && .\build.bat          # 用 MSVC 编译并链接 downloadcore.lib
 # 另开一个窗口起本地服务器：
 #   ..\target\release\serve.exe 64 2121

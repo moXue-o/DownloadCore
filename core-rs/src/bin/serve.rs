@@ -1,7 +1,7 @@
 //! 本地测试服务器：给 C 示例程序做离线对练用。
 //!
 //! 运行：
-//!   cargo run --release --bin serve -- [大小MB] [端口]
+//!   cargo run --release --bin serve -- [大小MB] [端口] [每连接限速B/s] [跳转延迟ms]
 //! 然后另开一个窗口：
 //!   cd cdemo && demo.exe http://127.0.0.1:2121/file.bin .
 

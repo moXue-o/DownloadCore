@@ -19,7 +19,7 @@ impl Limiter {
         Limiter {
             max_speed,
             burst,
-            inner: Lock::new(Inner { tokens: burst, last: Instant::now() }),
+            inner: Lock::new(Inner { tokens: 0.0, last: Instant::now() }),
         }
     }
 

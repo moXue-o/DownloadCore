@@ -179,7 +179,7 @@ fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf) {
     let size = 8 << 20;
     let data: Vec<u8> = (0..size).map(|i| ((i as u64 * 31 + 7) & 0xff) as u8).collect();
 
-    let (addr, _stop) = start_server(data.clone());
+    let (addr, stop) = start_server(data.clone());
     let url = format!("http://{addr}/file.bin");
 
     let mut cfg = Config::default();
@@ -215,25 +215,30 @@ fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf) {
             println!(">>> 自检失败！详见 {LOG_FILE}");
         }
     }
+    stop.store(true, Ordering::SeqCst); // 停掉自检用的本地服务器，别每次泄漏一个线程
 }
 
 // ---------------- 一个极简的本地测试服务器（仅用于 selftest） ----------------
 
 fn start_server(data: Vec<u8>) -> (SocketAddr, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let st = stop.clone();
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if st.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Ok(stream) = stream {
-                let d = data.clone();
-                thread::spawn(move || {
-                    let _ = serve(stream, &d);
-                });
+        while !st.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let d = data.clone();
+                    thread::spawn(move || {
+                        let _ = serve(stream, &d);
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
             }
         }
     });
