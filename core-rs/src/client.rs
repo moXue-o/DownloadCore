@@ -26,6 +26,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const POOL_IDLE_SECS: u64 = 90;
 /// "跳转后的真实地址"记多久（之后重新解析，避免签名过期）。
 const FINAL_URL_TTL: Duration = Duration::from_secs(300);
+/// 客户端缓存最多多少个来源键；超过就整体清空（防跨大量主机长期运行无界增长）。
+const MAX_CLIENT_KEYS: usize = 64;
 
 pub struct LtsBackend {
     rt: Arc<tokio::runtime::Runtime>,
@@ -92,7 +94,11 @@ impl LtsBackend {
         }
         let client =
             b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
-        self.clients.lock().unwrap_or_else(|e| e.into_inner()).insert(key, client.clone());
+        let mut m = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() > MAX_CLIENT_KEYS {
+            m.clear(); // 键数超限：整体清空（连同其连接池一起释放）
+        }
+        m.insert(key, client.clone());
         self.stat_client_builds.fetch_add(1, Ordering::Relaxed);
         Ok(client)
     }
