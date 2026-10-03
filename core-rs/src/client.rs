@@ -268,9 +268,15 @@ impl Backend for LtsBackend {
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_str(&resp, "content-range");
-        let (start, _, _) = parse_content_range(&cr)
-            .ok_or_else(|| retryable("range", format!("{ERR_RANGE_MISMATCH}: Content-Range 缺失")))?;
+        let (start, _, _) = match parse_content_range(&cr) {
+            Some(x) => x,
+            None => {
+                self.clear_final(&cache_key(&ep.url, ep.ip));
+                return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: Content-Range 缺失")));
+            }
+        };
         if start != from {
+            self.clear_final(&cache_key(&ep.url, ep.ip));
             return Err(retryable(
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 期望起点 {from}，服务器给了 {start}"),

@@ -175,6 +175,7 @@ impl Engine {
             &req.mirrors,
             &probe_headers,
             &|| shared.is_canceled(),
+            &|m| shared.logf("WARN", m),
         ) {
             Ok(x) => x,
             Err(e) => {
@@ -246,9 +247,14 @@ impl Engine {
             let _ = fs::remove_file(&marker);
             shared.status(Status::Downloading);
             if let Err(e) = self.download_whole(&shared, &limiter, &marker) {
-                // 取消要和分段分支一致：报 Canceled，不要报 Failed
-                let st = if e.kind == ErrorKind::Canceled { Status::Canceled } else { Status::Failed };
-                shared.status(st);
+                shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
+                if e.kind == ErrorKind::Canceled {
+                    shared.logf("WARN", "任务被取消（单线程模式不保留续传状态）");
+                    shared.status(Status::Canceled);
+                } else {
+                    shared.logf("ERROR", format!("任务失败：{e}"));
+                    shared.status(Status::Failed);
+                }
                 return Err(e);
             }
             // 整文件模式：若探路给了大小，就核对实际字节，防止被截断还当成功
@@ -420,6 +426,13 @@ impl Engine {
         workers.join_all();
         shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
 
+        // 用户主动取消优先：即使某工人恰好也报了个（因取消而生的）错误，也只算"取消"
+        if shared.user_canceled() {
+            shared.save_state(&temp_dir);
+            shared.logf("WARN", "任务被取消，已下进度已保留，可稍后续传");
+            shared.status(Status::Canceled);
+            return Err(Error::canceled());
+        }
         if let Some(e) = shared.first_err.lock().take() {
             shared.save_state(&temp_dir);
             shared.logf("ERROR", format!("任务失败：{e}"));
@@ -618,6 +631,9 @@ impl Engine {
                 Err(e) => return Err(e),
             }
         }
+        if shared.user_canceled() {
+            return Err(Error::canceled());
+        }
         Err(fatal(
             "whole",
             format!("{ERR_TOO_MANY_FAILURES}: {}", last_err.map(|e| e.to_string()).unwrap_or_default()),
@@ -746,6 +762,11 @@ impl Shared {
                 .as_ref()
                 .map(|c| c.load(Ordering::SeqCst))
                 .unwrap_or(false)
+    }
+
+    /// 只有"用户主动取消"（外部标志），不含内部出错触发的取消。
+    fn user_canceled(&self) -> bool {
+        self.external.as_ref().map(|c| c.load(Ordering::SeqCst)).unwrap_or(false)
     }
 
     fn is_paused(&self) -> bool {
@@ -994,8 +1015,8 @@ fn spawn_part(
         let p = part.lock();
         (p.from, p.to)
     };
-    s.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
     s.running.fetch_add(1, Ordering::SeqCst);
+    let s_log = s.clone();
     let handle = thread::spawn(move || {
         // 只要还有工人在写，就攥着目标文件锁（即便主线程已 panic 退出）
         let _tg = tg;
@@ -1038,6 +1059,7 @@ fn spawn_part(
             }
         }
     });
+    s_log.logf("DEBUG", format!("工人启动：段 [{from}, {to}]"));
     workers.push(handle);
 }
 
@@ -1083,6 +1105,9 @@ fn run_part(
             }
             Err(e) => return Err(e),
         }
+    }
+    if shared.user_canceled() {
+        return Err(Error::canceled());
     }
     Err(fatal(
         "part",
@@ -1201,6 +1226,10 @@ fn pump(
                     pending_off = 0;
                 }
                 Err(e) => {
+                    // 用户取消时，读错误不算失败，仍报"已取消"
+                    if shared.user_canceled() {
+                        return Err(Error::canceled());
+                    }
                     if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
                         shared.logf("WARN", "连接卡住（空闲超时）");
                     }

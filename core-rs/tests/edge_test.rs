@@ -539,6 +539,51 @@ fn setup_failure_reports_failed_status() {
 }
 
 #[test]
+fn cancel_during_read_error_is_canceled_not_failed() {
+    let data = make_data(2 << 20, 24);
+    let srv = TestServer::new(data);
+    srv.set_stall_after(32 << 10); // 每个连接发 32KB 后卡住
+    let dir = unique_dir("cancel-stall");
+    let out = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.max_retries = 0;
+    cfg.idle_timeout = Duration::from_millis(400);
+    let engine = Engine::new(cfg);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        c2.store(true, Ordering::SeqCst);
+    });
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let cbs = Callbacks {
+        on_status: Some(Box::new(move |s| s2.lock().unwrap().push(s.as_str().to_string()))),
+        ..Default::default()
+    };
+    let err = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                cancel: Some(cancel),
+                ..Default::default()
+            },
+            cbs,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.kind,
+        downloadcore::ErrorKind::Canceled,
+        "取消+读错误应报 Canceled，实际 {err:?}"
+    );
+    let st = seen.lock().unwrap().clone();
+    assert!(st.iter().any(|s| s == "canceled"), "状态应为 canceled，实际 {:?}", st);
+}
+
+#[test]
 fn resume_progress_starts_from_completed_bytes() {
     let data = make_data(4 << 20, 23);
     let srv = TestServer::new(data.clone());

@@ -186,6 +186,7 @@ pub fn build_pool(
     mirrors: &[String],
     headers: &[(String, String)],
     canceled: &dyn Fn() -> bool,
+    log: &dyn Fn(&str),
 ) -> Result<(Vec<Endpoint>, ProbeInfo)> {
     let eps = sources_for(cfg, primary);
     let rounds = cfg.max_retries.clamp(1, 3);
@@ -268,7 +269,11 @@ pub fn build_pool(
                 }
             }
         }
-        eps.extend(ok_mirror);
+        if ok_mirror.is_empty() {
+            log(&format!("镜像不可用或与主源不是同一文件，已跳过：{m}"));
+        } else {
+            eps.extend(ok_mirror);
+        }
     }
     Ok((eps, info))
 }
