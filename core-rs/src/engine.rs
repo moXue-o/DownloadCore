@@ -22,33 +22,42 @@ const SLOW_MIN_BYTES: i64 = 512 << 10;
 const SLOW_REMAINING_MIN: i64 = 64 << 10;
 /// 收尾阶段（活跃工人很少）允许把尾巴切到的最小粒度
 const TAIL_MIN: i64 = 128 << 10;
+/// 段数上限：防止"尾巴切细"把 parts 无限撑大（超大文件时的内存/序列化/O(n²) 保护）
+const MAX_PARTS: usize = 4096;
 
 /// 进程内"正在下载的目标文件"登记表：防止同一个目标被并发写坏。
 static ACTIVE_TARGETS: std::sync::OnceLock<Lock<HashSet<String>>> = std::sync::OnceLock::new();
 
 struct TargetGuard {
-    key: String,
+    final_key: String,
+    marker_key: String,
 }
 
 impl Drop for TargetGuard {
     fn drop(&mut self) {
         if let Some(s) = ACTIVE_TARGETS.get() {
-            s.lock().remove(&self.key);
+            let mut g = s.lock();
+            g.remove(&self.final_key);
+            g.remove(&self.marker_key);
         }
     }
 }
 
 /// 认领一个目标文件；已被别的下载任务占用则返回 None。
+/// 同时登记"最终路径"和"`.part` 标记路径"，防止 A 与 A.part 互为别名时绕过互斥。
 /// 返回 `Arc`：工人线程也持有副本，保证"只要还有工人在写，锁就不释放"。
-fn acquire_target(key: &str) -> Option<Arc<TargetGuard>> {
+fn acquire_target(final_key: &str, marker_key: &str) -> Option<Arc<TargetGuard>> {
     let set = ACTIVE_TARGETS.get_or_init(|| Lock::new(HashSet::new()));
     let mut g = set.lock();
-    if g.contains(key) {
-        None
-    } else {
-        g.insert(key.to_string());
-        Some(Arc::new(TargetGuard { key: key.to_string() }))
+    if g.contains(final_key) || g.contains(marker_key) {
+        return None;
     }
+    g.insert(final_key.to_string());
+    g.insert(marker_key.to_string());
+    Some(Arc::new(TargetGuard {
+        final_key: final_key.to_string(),
+        marker_key: marker_key.to_string(),
+    }))
 }
 const MAX_SLOW_RECONNECTS: usize = 8;
 // 绝对"卡死"线：低于它就重开（与整体快慢无关）
@@ -185,10 +194,12 @@ impl Engine {
         // 确定最终路径
         let (final_path, temp_dir) = self.setup_paths(&req, &pi)?;
         let marker = PathBuf::from(format!("{}{}", final_path.display(), self.cfg.incomplete_suffix));
+        let _ = shared.out_path.set(marker.clone());
 
-        // 防并发：同一个目标文件同时只允许一个下载任务写（否则两个任务会写坏同一个 .part）
+        // 防并发：同一个目标文件同时只允许一个下载任务写（含 `.part` 别名）
         let abs_key = target_key(&final_path);
-        let _target_guard = match acquire_target(&abs_key) {
+        let marker_key = target_key(&marker);
+        let _target_guard = match acquire_target(&abs_key, &marker_key) {
             Some(g) => g,
             None => {
                 shared.logf("ERROR", "目标文件正在被另一个下载任务使用，已拒绝");
@@ -219,6 +230,16 @@ impl Engine {
                 let st = if e.kind == ErrorKind::Canceled { Status::Canceled } else { Status::Failed };
                 shared.status(st);
                 return Err(e);
+            }
+            // 整文件模式：若探路给了大小，就核对实际字节，防止被截断还当成功
+            let got = shared.downloaded.load(Ordering::SeqCst);
+            if size > 0 && got != size {
+                shared.logf(
+                    "ERROR",
+                    format!("下载字节数（{got}）与声明大小（{size}）不符，判定失败（可能被截断）"),
+                );
+                shared.status(Status::Failed);
+                return Err(fatal("whole", "实际下载字节数与声明大小不符（可能被截断）"));
             }
             shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
             if let Err(e) = move_into_place(&marker, &final_path) {
@@ -614,6 +635,8 @@ struct Shared {
     src_conns: std::sync::OnceLock<Vec<AtomicUsize>>,
     /// 目标文件锁：共享里也存一份，工人线程各持一份，防止主线程 panic 后提前放锁
     target_guard: std::sync::OnceLock<Arc<TargetGuard>>,
+    /// 输出文件（.part）路径：save_state 前先 fsync 它，避免"状态超前于数据"
+    out_path: std::sync::OnceLock<PathBuf>,
 }
 
 struct ProgState {
@@ -649,6 +672,7 @@ impl Shared {
             src_bytes: std::sync::OnceLock::new(),
             src_conns: std::sync::OnceLock::new(),
             target_guard: std::sync::OnceLock::new(),
+            out_path: std::sync::OnceLock::new(),
         }
     }
 
@@ -699,20 +723,22 @@ impl Shared {
         self.headers.get().cloned().unwrap_or_default()
     }
 
-    /// 取"给某个来源用的请求头"：跨域来源要剥掉敏感头（Authorization/Cookie 等）。
+    /// 取"给某个来源用的请求头"：跨域来源要剥掉敏感头（Authorization/Cookie 等）；
+    /// 另外一律丢掉用户的 Accept-Encoding（我们只发 identity，免得服务器回压缩体）。
     fn headers_for(&self, url: &str) -> Vec<(String, String)> {
+        let same = crate::backend::same_origin(&self.url(), url);
         let h = self.headers();
-        if crate::backend::same_origin(&self.url(), url) {
-            h
-        } else {
-            crate::backend::redact_sensitive(&h)
-        }
+        let mut out =
+            if same { h } else { crate::backend::redact_sensitive(&h) };
+        out.retain(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"));
+        out
     }
 
     /// 有"身份证"时用 `If-Range` 的值（优先 ETag，其次 Last-Modified）。
     fn if_range_value(&self) -> Option<String> {
         let e = self.etag.lock().clone();
-        if !e.is_empty() {
+        // 弱校验器（W/"..."）不能用于 If-Range（RFC 7233），退而用 Last-Modified
+        if !e.is_empty() && !e.trim_start().starts_with("W/") {
             return Some(e);
         }
         let m = self.last_mod.lock().clone();
@@ -755,6 +781,12 @@ impl Shared {
     }
 
     fn save_state(&self, temp_dir: &Path) {
+        // 先把输出文件的已写数据落盘，再记状态——否则"状态超前于数据"，断电后续传会跳过没落盘的区域
+        if let Some(p) = self.out_path.get() {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) {
+                let _ = f.sync_all();
+            }
+        }
         let parts: Vec<PartState> = self
             .parts
             .lock()
@@ -792,6 +824,10 @@ fn speed_of(bytes: i64, elapsed: Duration) -> i64 {
 }
 
 fn move_into_place(src: &Path, final_path: &Path) -> Result<()> {
+    // 改名之前先把数据落盘，避免"文件已改名、内容还在页缓存"的掉电风险
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(src) {
+        let _ = f.sync_all();
+    }
     // 直接改名（覆盖已存在的目标）。不要"先删后改"——那样中途失败会把旧文件也搞没。
     fs::rename(src, final_path).map_err(|e| fatal("rename", format!("改名失败: {e}")))
 }
@@ -824,6 +860,10 @@ fn parts_cover(parts: &[PartState], size: i64) -> bool {
 
 /// 从所有段里挑"剩下活最多"的那段来分裂。
 fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
+    // 段数封顶：别让超大切细把 parts 撑爆
+    if shared.parts.lock().len() >= MAX_PARTS {
+        return None;
+    }
     // 收尾阶段（活跃工人很少）时，允许把尾巴切得更细，
     // 免得最后几 MB 只剩一条被限速的连接慢慢滴。
     let running = shared.running.load(Ordering::SeqCst);

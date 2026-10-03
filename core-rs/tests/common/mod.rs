@@ -26,6 +26,7 @@ struct Shared {
     require_header: Arc<Mutex<Option<(String, String)>>>,
     reject_range: Arc<AtomicBool>,
     reject_if_range: Arc<AtomicBool>,
+    early_hints: Arc<AtomicBool>,
     capture_name: Arc<Mutex<Option<String>>>,
     captured: Arc<Mutex<Option<String>>>,
 }
@@ -58,6 +59,7 @@ impl TestServer {
             require_header: Arc::new(Mutex::new(None)),
             reject_range: Arc::new(AtomicBool::new(false)),
             reject_if_range: Arc::new(AtomicBool::new(false)),
+            early_hints: Arc::new(AtomicBool::new(false)),
             capture_name: Arc::new(Mutex::new(None)),
             captured: Arc::new(Mutex::new(None)),
         };
@@ -136,6 +138,10 @@ impl TestServer {
     /// 带 If-Range 的请求一律回 200（模拟"内容已变，验证器不匹配"）。
     pub fn set_reject_if_range(&self, v: bool) {
         self.shared.reject_if_range.store(v, Ordering::SeqCst);
+    }
+    /// 正式响应前先发一个 103 Early Hints（测客户端要跳过 1xx）。
+    pub fn set_early_hints(&self, v: bool) {
+        self.shared.early_hints.store(v, Ordering::SeqCst);
     }
     /// 记录收到的某个请求头的值（测跨域跳转是否剥掉敏感头）。
     pub fn set_capture_header(&self, name: &str) {
@@ -232,6 +238,11 @@ fn handle_conn(mut stream: TcpStream, sh: Shared) -> std::io::Result<()> {
         return Ok(());
     }
 
+    // 正式响应前先发一个 103 Early Hints（客户端必须跳过它）
+    if sh.early_hints.load(Ordering::SeqCst) {
+        stream.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </x.css>; rel=preload\r\n\r\n")?;
+    }
+
     if sh.no_range.load(Ordering::SeqCst) || range.is_none() {
         write_response(&mut stream, &body, 200, None, &etag, size, chunked, stall, bps)?;
         return Ok(());
@@ -318,7 +329,7 @@ fn write_body_chunked(stream: &mut TcpStream, data: &[u8], stall_after: i64, bps
         if throttle(written, chunk.len(), stall_after, bps) {
             return Ok(()); // 中途停掉：不写结束块，客户端应超时
         }
-        stream.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())?;
+        stream.write_all(format!("{:x};ext=1\r\n", chunk.len()).as_bytes())?;
         stream.write_all(chunk)?;
         stream.write_all(b"\r\n")?;
         stream.flush()?;

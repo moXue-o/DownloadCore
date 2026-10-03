@@ -123,6 +123,15 @@ fn redirect_is_followed() {
 }
 
 #[test]
+fn early_hints_are_skipped() {
+    let data = make_data(300_000, 20);
+    let srv = TestServer::new(data.clone());
+    srv.set_early_hints(true); // 正式响应前先来一个 103
+    let body = client().open_plain(&Target::new(srv.url()), &[]).unwrap();
+    assert_eq!(read_all(body), data, "1xx 临时响应应被跳过");
+}
+
+#[test]
 fn idle_timeout_is_reported() {
     let srv = TestServer::new(make_data(2 << 20, 11));
     srv.set_stall_after(32 << 10); // 发 32KB 后卡住

@@ -38,6 +38,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: usize = 500;
 /// 每个来源最多缓存多少条空闲长连接（对齐最大并发，避免"用完就关、下次重连"）
 const POOL_MAX_IDLE: usize = 32;
+/// 连接池最多记多少个"来源键"；超过就清理过期项（防跨大量主机长期运行无界增长）
+const MAX_POOL_KEYS: usize = 64;
+/// 跳转缓存最多多少条；超过就清理过期项/整体清空
+const MAX_FINAL_CACHE: usize = 256;
 /// 空闲连接最长留多久
 const POOL_IDLE_MAX: Duration = Duration::from_secs(30);
 /// "跳转后的真实地址"记多久（之后重新解析，避免签名过期）
@@ -218,10 +222,14 @@ impl NetClient {
         }
         let (status, hdrs, body, final_url) = self.request_follow(url, pin, headers, range)?;
         if final_url != url {
-            self.final_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(ck, (final_url, Instant::now()));
+            let mut m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if m.len() > MAX_FINAL_CACHE {
+                m.retain(|_, (_, t)| t.elapsed() < FINAL_URL_TTL);
+                if m.len() > MAX_FINAL_CACHE {
+                    m.clear();
+                }
+            }
+            m.insert(ck, (final_url, Instant::now()));
         }
         Ok((status, hdrs, body))
     }
@@ -282,7 +290,7 @@ impl NetClient {
                 let next = resolve(&u, loc);
                 self.stat_follows.fetch_add(1, Ordering::Relaxed);
                 // 跳转用的连接也回收：否则每个分段都要重新和"跳转服务器"握手
-                self.recycle_conn(reader, &key, &hdrs);
+                self.recycle_conn(reader, &key, &hdrs, status);
                 current = next;
                 continue;
             }
@@ -308,9 +316,15 @@ impl NetClient {
             .write_all(req.as_bytes())
             .map_err(|e| map_io("send", e))?;
         reader.get_mut().flush().map_err(|e| map_io("send", e))?;
-        let status = read_status_line(reader)?;
-        let hdrs = read_headers(reader)?;
-        Ok((status, hdrs))
+        // 跳过 1xx 临时响应（103 Early Hints 等），一直读到最终响应
+        loop {
+            let status = read_status_line(reader)?;
+            let hdrs = read_headers(reader)?;
+            if (100..200).contains(&status) && status != 101 {
+                continue;
+            }
+            return Ok((status, hdrs));
+        }
     }
 
     /// 从池里取一条（仍新鲜）的连接；没有就新建。
@@ -331,18 +345,28 @@ impl NetClient {
     }
 
     /// 把一条（确认没有响应体的）连接放回池里复用。
-    fn recycle_conn(&self, reader: BufReader<Stream>, key: &str, hdrs: &[(String, String)]) {
+    fn recycle_conn(&self, reader: BufReader<Stream>, key: &str, hdrs: &[(String, String)], status: u16) {
         if !wants_keep_alive(hdrs) {
             return;
         }
-        // 有响应体而我们没读 → 不能复用（否则下条响应会串味）
         let te_chunked =
             header_get(hdrs, "transfer-encoding").to_ascii_lowercase().contains("chunked");
+        let has_cl = hdrs.iter().any(|(k, _)| k == "content-length");
         let clen = header_get(hdrs, "content-length").trim().parse::<u64>().unwrap_or(0);
-        if te_chunked || clen > 0 || !reader.buffer().is_empty() {
+        // 只有"确定没有响应体"才敢复用：204/304/1xx，或显式 Content-Length: 0。
+        // 缺 CL 又非 chunked 的响应是"读到连接关闭"定界的，可能带体 → 绝不复用（否则下条响应串味）。
+        let no_body = matches!(status, 204 | 304) || (100..200).contains(&status) || (has_cl && clen == 0);
+        if te_chunked || !no_body || !reader.buffer().is_empty() {
             return;
         }
         let mut m = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        // 池子键数封顶：跨大量主机长期运行时，防止连接/fd 无界增长
+        if m.len() > MAX_POOL_KEYS && !m.contains_key(key) {
+            m.retain(|_, v| {
+                v.retain(|p| p.idle.elapsed() < POOL_IDLE_MAX);
+                !v.is_empty()
+            });
+        }
         let v = m.entry(key.to_string()).or_default();
         if v.len() < POOL_MAX_IDLE {
             v.push(Pooled { reader, idle: Instant::now() });
@@ -597,9 +621,10 @@ fn read_mode(inner: &mut BufReader<Stream>, mode: &mut Mode, buf: &mut [u8]) -> 
                 if line.is_empty() {
                     continue; // 容忍多余空行
                 }
-                let size = u64::from_str_radix(line.trim(), 16).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("chunk 大小不合法: {line}"))
-                })?;
+                let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("chunk 大小不合法: {line}"))
+                    })?;
                 if size == 0 {
                     // 收尾：读掉 trailer，直到空行
                     loop {
@@ -666,7 +691,8 @@ fn read_line<R: BufRead>(r: &mut R) -> io::Result<String> {
 
 fn read_status_line<R: BufRead>(r: &mut R) -> Result<u16> {
     let line = read_line(r).map_err(|e| map_io("response", e))?;
-    let code = line.split(' ').nth(1).unwrap_or("");
+    // 用 split_whitespace：容忍 `HTTP/1.1  200` 这种多空格（非合规但常见）
+    let code = line.split_whitespace().nth(1).unwrap_or("");
     code.parse::<u16>().map_err(|_| retryable("response", format!("状态行不合法: {line}")))
 }
 
@@ -726,10 +752,12 @@ fn build_request(
     range: Option<(i64, i64)>,
 ) -> String {
     let default_port = if u.https { 443 } else { 80 };
+    // IPv6 字面量要加方括号，否则 Host 头非法
+    let host_disp = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host.clone() };
     let host_header = if u.port == default_port {
-        u.host.clone()
+        host_disp
     } else {
-        format!("{}:{}", u.host, u.port)
+        format!("{host_disp}:{}", u.port)
     };
 
     let mut s = String::with_capacity(256);
@@ -740,10 +768,11 @@ fn build_request(
     s.push_str("Accept-Encoding: identity\r\n");
 
     for (k, v) in headers {
-        // host/range/connection 由我们自己控制，避免重复或误覆盖
+        // host/range/connection/accept-encoding 由我们自己控制，避免重复或误覆盖
         if k.eq_ignore_ascii_case("host")
             || k.eq_ignore_ascii_case("range")
             || k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("accept-encoding")
         {
             continue;
         }
@@ -783,31 +812,43 @@ struct ParsedUrl {
 
 fn parse_url(raw: &str) -> Result<ParsedUrl> {
     let raw = raw.trim();
+    // 去掉 fragment（#...）：它不属于请求目标
+    let raw = match raw.find('#') {
+        Some(i) => &raw[..i],
+        None => raw,
+    };
     let (scheme, rest) =
         raw.split_once("://").ok_or_else(|| fatal("url", format!("网址不合法: {raw}")))?;
-    let https = match scheme.to_ascii_lowercase().as_str() {
+    let scheme_l = scheme.to_ascii_lowercase();
+    let https = match scheme_l.as_str() {
         "http" => false,
         "https" => true,
         other => return Err(fatal("url", format!("不支持的协议: {other}"))),
     };
 
-    // 去掉 userinfo（user:pass@host），但别把路径里的 '@' 误伤
+    // 去掉 userinfo（user:pass@host），但别把路径/查询里的 '@' 误伤
     let rest = match rest.find('@') {
-        Some(i) if !rest[..i].contains('/') => &rest[i + 1..],
+        Some(i) if !rest[..i].contains(['/', '?']) => &rest[i + 1..],
         _ => rest,
     };
 
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
+    // authority 到第一个 '/' 或 '?' 为止（否则 `http://host?x=1` 会把查询串并进主机名）
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let path = &rest[end..];
     if authority.is_empty() {
         return Err(fatal("url", format!("网址缺少主机: {raw}")));
     }
 
     let (host, port) = split_host_port(authority, https)?;
-    let path_query = if path.is_empty() { "/".to_string() } else { path.to_string() };
-    let origin = format!("{}://{}", if https { "https" } else { "http" }, authority);
+    let path_query = if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('?') {
+        format!("/{path}") // 只有查询串 → 补上根路径
+    } else {
+        path.to_string()
+    };
+    let origin = format!("{scheme_l}://{authority}");
     Ok(ParsedUrl { https, host, port, path_query, origin })
 }
 
@@ -833,9 +874,12 @@ fn split_host_port(authority: &str, https: bool) -> Result<(String, u16)> {
     }
 }
 
-/// 把 Location 解析成绝对地址（支持绝对 / 协议相对 / 根相对 / 目录相对）。
+/// 把 Location 解析成绝对地址（绝对 / 协议相对 / 根相对 / 仅查询 / 目录相对含 `./` `../`）。
 fn resolve(base: &ParsedUrl, location: &str) -> String {
     let loc = location.trim();
+    if loc.is_empty() {
+        return format!("{}{}", base.origin, base.path_query);
+    }
     if loc.starts_with("http://") || loc.starts_with("https://") {
         return loc.to_string();
     }
@@ -843,14 +887,47 @@ fn resolve(base: &ParsedUrl, location: &str) -> String {
         let scheme = if base.https { "https:" } else { "http:" };
         return format!("{scheme}//{rest}");
     }
+    // 仅查询/仅锚点：保留原路径
+    if loc.starts_with('?') {
+        let p = base.path_query.split(['?', '#']).next().unwrap_or("/");
+        return format!("{}{}{}", base.origin, p, loc);
+    }
+    if loc.starts_with('#') {
+        return format!("{}{}", base.origin, base.path_query);
+    }
     if loc.starts_with('/') {
         return format!("{}{}", base.origin, loc);
     }
-    let dir = match base.path_query.rfind('/') {
-        Some(i) => &base.path_query[..=i],
+    // 目录相对：以 base 的目录为基，合并并处理 ./ ../
+    let base_path = base.path_query.split(['?', '#']).next().unwrap_or("/");
+    let dir = match base_path.rfind('/') {
+        Some(i) => &base_path[..=i],
         None => "/",
     };
-    format!("{}{}{}", base.origin, dir, loc)
+    format!("{}{}", base.origin, merge_path(dir, loc))
+}
+
+/// 按 RFC 3986 的“合并路径”语义，把相对引用并到目录上。
+fn merge_path(dir: &str, rel: &str) -> String {
+    let (rel_path, suffix) = match rel.find(['?', '#']) {
+        Some(i) => (&rel[..i], &rel[i..]),
+        None => (rel, ""),
+    };
+    let mut segs: Vec<&str> = dir.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    for part in rel_path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            p => segs.push(p),
+        }
+    }
+    if segs.is_empty() {
+        format!("/{suffix}")
+    } else {
+        format!("/{}{suffix}", segs.join("/"))
+    }
 }
 
 // ---------------- 接入统一后端接口 ----------------
@@ -892,5 +969,43 @@ impl Backend for NetClient {
             self.stat_follows.load(Ordering::Relaxed),
             self.stat_conn_fail.load(Ordering::Relaxed),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(s: &str) -> Result<u16> {
+        let mut r = std::io::BufReader::new(std::io::Cursor::new(s.as_bytes().to_vec()));
+        read_status_line(&mut r)
+    }
+
+    #[test]
+    fn status_line_tolerates_extra_spaces() {
+        assert_eq!(status("HTTP/1.1  200 OK\r\n").unwrap(), 200);
+        assert_eq!(status("HTTP/1.1 206 Partial Content\r\n").unwrap(), 206);
+    }
+
+    #[test]
+    fn parse_url_handles_query_only_and_fragment() {
+        let u = parse_url("http://host?token=1").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.path_query.as_str()), ("host", 80, "/?token=1"));
+        let u = parse_url("http://host/a/b#frag").unwrap();
+        assert_eq!(u.path_query, "/a/b");
+        let u = parse_url("https://host").unwrap();
+        assert_eq!((u.port, u.path_query.as_str()), (443, "/"));
+    }
+
+    #[test]
+    fn resolve_cases() {
+        let base = parse_url("http://h/a/b/c").unwrap();
+        assert_eq!(resolve(&base, "?page=2"), "http://h/a/b/c?page=2");
+        assert_eq!(resolve(&base, "../x"), "http://h/a/x");
+        assert_eq!(resolve(&base, "./x"), "http://h/a/b/x");
+        assert_eq!(resolve(&base, "d"), "http://h/a/b/d");
+        assert_eq!(resolve(&base, "/root"), "http://h/root");
+        assert_eq!(resolve(&base, "//other/z"), "http://other/z");
+        assert_eq!(resolve(&base, "https://x/y"), "https://x/y");
     }
 }

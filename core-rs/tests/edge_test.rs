@@ -464,3 +464,49 @@ fn single_thread_cancel_reports_canceled_status() {
     assert!(st.iter().any(|s| s == "canceled"), "单线程取消应报 canceled，实际 {:?}", st);
     assert!(!st.iter().any(|s| s == "failed"), "取消不应报 failed，实际 {:?}", st);
 }
+
+#[test]
+fn accept_encoding_is_forced_identity() {
+    let data = make_data(1 << 20, 20);
+    let srv = TestServer::new(data.clone());
+    srv.set_capture_header("accept-encoding");
+    let dir = unique_dir("acceptenc");
+    let out = dir.join("out.bin");
+    let engine = Engine::new(test_config(&dir));
+
+    // 宿主塞了自己的 Accept-Encoding：客户端必须只发 identity（否则可能落盘压缩体）
+    let res = download(
+        &engine,
+        &srv.url(),
+        &out,
+        vec![("Accept-Encoding".to_string(), "gzip, br".to_string())],
+    )
+    .unwrap();
+    assert_eq!(read_file(&res.path), data);
+    assert_eq!(srv.captured().as_deref(), Some("identity"), "只应发送 identity");
+}
+
+#[test]
+fn marker_alias_is_mutually_excluded() {
+    let data = make_data(4 << 20, 21);
+    let srv = TestServer::new(data);
+    srv.set_speed(512 << 10); // 慢一点，保证 A 还在跑
+    let dir = unique_dir("alias");
+    let a = dir.join("out.bin");
+    let b = dir.join("out.bin.part"); // 正好等于 A 的 `.part` 标记路径
+    let engine = Arc::new(Engine::new(test_config(&dir)));
+
+    let e2 = engine.clone();
+    let url = srv.url();
+    let ap = a.display().to_string();
+    let h = thread::spawn(move || {
+        let _ = e2.download(
+            Request { url, target_file: Some(ap), ..Default::default() },
+            Callbacks::default(),
+        );
+    });
+    thread::sleep(Duration::from_millis(300));
+    let err = download(&engine, &srv.url(), &b, vec![]).unwrap_err();
+    assert!(err.message.contains("正在被另一个"), "别名为标记路径时也应被拒绝: {}", err.message);
+    h.join().unwrap();
+}
