@@ -342,3 +342,125 @@ fn if_range_mismatch_fails_loudly() {
     assert!(!err.message.is_empty());
     assert!(!out.exists(), "失败时不应留下正式文件");
 }
+
+// ---------------- 并发/生命周期回归 ----------------
+
+#[test]
+fn main_thread_callback_panic_does_not_leak_workers_or_lock() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::AtomicUsize;
+
+    let data = make_data(4 << 20, 16);
+    let srv = TestServer::new(data.clone());
+    let dir = unique_dir("panic-cb");
+    let out = dir.join("out.bin");
+    let engine = Engine::new(test_config(&dir));
+
+    // 在"主线程"第 2 次打"工人启动"时 panic：此刻已有 1 个工人在跑
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    let cbs = Callbacks {
+        on_log: Some(Box::new(move |e| {
+            if e.message.starts_with("工人启动") && n2.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                panic!("宿主回调故意 panic");
+            }
+        })),
+        ..Default::default()
+    };
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        engine.download(
+            Request { url: srv.url(), target_file: Some(out.display().to_string()), ..Default::default() },
+            cbs,
+        )
+    }));
+    assert!(r.is_err(), "主线程回调 panic 应当向外传出");
+
+    // 关键：panic 后工人必须已被回收、目标锁必须已释放 → 同一目标能立刻再下
+    let res = engine.download(
+        Request { url: srv.url(), target_file: Some(out.display().to_string()), ..Default::default() },
+        Callbacks::default(),
+    );
+    assert!(res.is_ok(), "panic 后目标锁未释放（工人被遗弃）: {:?}", res.err());
+    assert_eq!(read_file(&res.unwrap().path), data);
+}
+
+#[test]
+fn cancel_is_prompt_under_speed_limit() {
+    let data = make_data(8 << 20, 18);
+    let srv = TestServer::new(data);
+    let dir = unique_dir("limit-cancel");
+    let out = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.max_speed = 16 * 1024; // 16 KB/s：若睡眠不封顶，取消要等很久才生效
+    cfg.max_retries = 0;
+    cfg.idle_timeout = Duration::from_secs(5);
+    let engine = Engine::new(cfg);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        c2.store(true, Ordering::SeqCst);
+    });
+    let t0 = std::time::Instant::now();
+    let err = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                cancel: Some(cancel),
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, downloadcore::ErrorKind::Canceled);
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "限速下取消应很快返回，实际 {:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
+fn single_thread_cancel_reports_canceled_status() {
+    let data = make_data(4 << 20, 17);
+    let srv = TestServer::new(data);
+    srv.set_no_range(true); // 走单线程整文件分支
+    srv.set_speed(1 << 20);
+    let dir = unique_dir("whole-cancel");
+    let out = dir.join("out.bin");
+    let mut cfg = test_config(&dir);
+    cfg.max_retries = 0;
+    cfg.idle_timeout = Duration::from_secs(5);
+    let engine = Engine::new(cfg);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        c2.store(true, Ordering::SeqCst);
+    });
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let cbs = Callbacks {
+        on_status: Some(Box::new(move |s| s2.lock().unwrap().push(s.as_str().to_string()))),
+        ..Default::default()
+    };
+    let err = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                cancel: Some(cancel),
+                ..Default::default()
+            },
+            cbs,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, downloadcore::ErrorKind::Canceled);
+    let st = seen.lock().unwrap().clone();
+    assert!(st.iter().any(|s| s == "canceled"), "单线程取消应报 canceled，实际 {:?}", st);
+    assert!(!st.iter().any(|s| s == "failed"), "取消不应报 failed，实际 {:?}", st);
+}

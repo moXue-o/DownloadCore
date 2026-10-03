@@ -56,6 +56,37 @@ const STUCK_RATE: f64 = 20.0 * 1024.0;
 // "公平份额"线：整体每连接超过它，才谈得上"这条被饿着"（避免争抢时误判）
 const FAIR_RATE: f64 = 150.0 * 1024.0;
 
+/// 工人线程池：无论正常结束还是 `run` 中途 panic，`Drop` 都先取消再 join，
+/// 杜绝"宿主回调 panic → 主线程展开 → 工人被 detach 继续用回调/userdata"。
+struct Workers {
+    handles: Vec<JoinHandle<()>>,
+    shared: Arc<Shared>,
+}
+
+impl Workers {
+    fn new(shared: &Arc<Shared>) -> Self {
+        Workers { handles: Vec::new(), shared: shared.clone() }
+    }
+    fn push(&mut self, h: JoinHandle<()>) {
+        self.handles.push(h);
+    }
+    fn reap_finished(&mut self) {
+        self.handles.retain(|h| !h.is_finished());
+    }
+    fn join_all(&mut self) {
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        self.shared.cancel.store(true, Ordering::SeqCst);
+        self.join_all();
+    }
+}
+
 /// 下载核心。只负责把一个 URL 下成一个文件。
 ///
 /// 并发模型：**一个工人一条线程**（阻塞式），天然吻合"每段一条连接"的下载语义，
@@ -115,9 +146,21 @@ impl Engine {
 
         shared.status(Status::Probing);
         // 建来源池（主地址 + 镜像/多 IP）并探路
-        let (eps, pi) = match build_pool(self.backend.as_ref(), &self.cfg, &req.url, &req.mirrors, &req.headers) {
+        let (eps, pi) = match build_pool(
+            self.backend.as_ref(),
+            &self.cfg,
+            &req.url,
+            &req.mirrors,
+            &req.headers,
+            &|| shared.is_canceled(),
+        ) {
             Ok(x) => x,
             Err(e) => {
+                if shared.is_canceled() {
+                    shared.logf("WARN", "任务在探路阶段被取消");
+                    shared.status(Status::Canceled);
+                    return Err(Error::canceled());
+                }
                 shared.status(Status::Failed);
                 return Err(e);
             }
@@ -172,7 +215,9 @@ impl Engine {
             let _ = fs::remove_file(&marker);
             shared.status(Status::Downloading);
             if let Err(e) = self.download_whole(&shared, &limiter, &marker) {
-                shared.status(Status::Failed);
+                // 取消要和分段分支一致：报 Canceled，不要报 Failed
+                let st = if e.kind == ErrorKind::Canceled { Status::Canceled } else { Status::Failed };
+                shared.status(st);
                 return Err(e);
             }
             shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
@@ -203,7 +248,7 @@ impl Engine {
 
         shared.status(Status::Downloading);
 
-        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        let mut workers = Workers::new(&shared);
         let mut last_state_save = Instant::now();
         let mut rate_t = Instant::now();
         let mut rate_bytes = 0i64;
@@ -303,13 +348,13 @@ impl Engine {
                         None => break,
                     },
                 };
-                spawn_part(&mut handles, &shared, &limiter, &self.cfg, &marker, part);
+                spawn_part(&mut workers, &shared, &limiter, &self.cfg, &marker, part);
             }
             if shared.running.load(Ordering::SeqCst) == 0 && shared.queue.lock().is_empty() {
                 break;
             }
             // 回收已结束的线程
-            handles.retain(|h| !h.is_finished());
+            workers.reap_finished();
             if last_state_save.elapsed() >= Duration::from_secs(1) {
                 last_state_save = Instant::now();
                 shared.save_state(&temp_dir);
@@ -318,9 +363,7 @@ impl Engine {
         }
 
         // 收工：等所有工人退出（取消 / 出错时它们会很快看到标志）
-        for h in handles.drain(..) {
-            let _ = h.join();
-        }
+        workers.join_all();
         shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
 
         if let Some(e) = shared.first_err.lock().take() {
@@ -809,7 +852,7 @@ fn split_one(shared: &Arc<Shared>, cfg: &Config) -> Option<Arc<Lock<Part>>> {
 }
 
 fn spawn_part(
-    handles: &mut Vec<JoinHandle<()>>,
+    workers: &mut Workers,
     shared: &Arc<Shared>,
     limiter: &Arc<Limiter>,
     cfg: &Config,
@@ -869,7 +912,7 @@ fn spawn_part(
             }
         }
     });
-    handles.push(handle);
+    workers.push(handle);
 }
 
 fn run_part(
@@ -1050,6 +1093,11 @@ fn pump(
             .is_err()
         {
             return Err(Error::canceled());
+        }
+        // 限速时，睡眠是"故意的"，不能算进慢连接窗口——否则会被自己限速判成"卡死"而乱重连
+        if cfg.max_speed > 0 {
+            window_start = Instant::now();
+            window_bytes = 0;
         }
 
         if watch_slow && window_start.elapsed() >= SLOW_WINDOW {

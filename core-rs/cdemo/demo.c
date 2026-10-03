@@ -31,6 +31,17 @@ static_assert(sizeof(dc_result) == 40, "dc_result layout mismatch");
 
 static FILE* g_log = NULL;
 
+/* 回调会被多个工人线程并发调用：日志与"每秒一条"的节流都要加锁 */
+#ifdef _WIN32
+static CRITICAL_SECTION g_log_cs;
+static CRITICAL_SECTION g_prog_cs;
+#define LOCK(cs)   EnterCriticalSection(&(cs))
+#define UNLOCK(cs) LeaveCriticalSection(&(cs))
+#else
+#define LOCK(cs)   ((void)0)
+#define UNLOCK(cs) ((void)0)
+#endif
+
 #ifdef _WIN32
 static UINT g_old_cp = 0;
 static void restore_console_cp(void) { SetConsoleOutputCP(g_old_cp); }
@@ -47,6 +58,7 @@ static void ts_now(char* out, size_t n) {
 static void logline(const char* level, const char* msg) {
     char ts[32];
     ts_now(ts, sizeof ts);
+    LOCK(g_log_cs);
     if (g_log) {
         fprintf(g_log, "%s [%s] %s\n", ts, level, msg);
         fflush(g_log);
@@ -55,6 +67,7 @@ static void logline(const char* level, const char* msg) {
         printf("%s [%s] %s\n", ts, level, msg);
         fflush(stdout);
     }
+    UNLOCK(g_log_cs);
 }
 
 static const char* status_name(int s) {
@@ -89,8 +102,11 @@ static void on_progress(void* ud, const dc_progress* p) {
     time_t now = time(NULL);
     char buf[160];
     (void)ud;
-    if (now == last) return; /* 每秒最多一条 */
-    last = now;
+    LOCK(g_prog_cs);
+    int emit = (now != last); /* 每秒最多一条（多线程下也要原子地判断/更新） */
+    if (emit) last = now;
+    UNLOCK(g_prog_cs);
+    if (!emit) return;
     double pct = p->total > 0 ? (double)p->downloaded / (double)p->total * 100.0 : 0.0;
     snprintf(buf, sizeof buf, "进度：%.1f%%  已下 %.2f/%.2f MB  %.2f MB/s  分段 %zu",
              pct,
@@ -145,6 +161,8 @@ int main(int argc, char** argv) {
     g_old_cp = GetConsoleOutputCP();
     SetConsoleOutputCP(CP_UTF8);
     atexit(restore_console_cp);
+    InitializeCriticalSection(&g_log_cs);
+    InitializeCriticalSection(&g_prog_cs);
 #endif
 
     /* 打开日志：新文件写 UTF-8 BOM，方便记事本识别中文 */

@@ -6,7 +6,7 @@
 //! 引擎、分段、续传、看门狗、写文件等全部与后端无关，因此"写一次代码、打包两个版本"。
 
 use crate::config::Config;
-use crate::errors::{retryable, Result};
+use crate::errors::{retryable, Error, Result};
 use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 
@@ -171,6 +171,7 @@ pub fn build_pool(
     primary: &str,
     mirrors: &[String],
     headers: &[(String, String)],
+    canceled: &dyn Fn() -> bool,
 ) -> Result<(Vec<Endpoint>, ProbeInfo)> {
     let mut eps = sources_for(cfg, primary);
 
@@ -179,6 +180,9 @@ pub fn build_pool(
     let mut last_err = None;
     'outer: for r in 0..rounds {
         for ep in eps.iter() {
+            if canceled() {
+                return Err(Error::canceled());
+            }
             match be.probe(ep, headers) {
                 Ok(pi) => {
                     info = Some(pi);
@@ -188,6 +192,9 @@ pub fn build_pool(
             }
         }
         if r + 1 < rounds {
+            if canceled() {
+                return Err(Error::canceled());
+            }
             std::thread::sleep(cfg.retry_delay);
         }
     }
@@ -201,6 +208,9 @@ pub fn build_pool(
     for m in mirrors {
         if m.trim().is_empty() {
             continue;
+        }
+        if canceled() {
+            return Err(Error::canceled());
         }
         // 先用单个来源探路，确认是同一文件再纳入（并展开多 IP）
         let m_headers: Vec<(String, String)> = if same_origin(primary, m) {

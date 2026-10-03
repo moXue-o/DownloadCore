@@ -53,6 +53,10 @@ impl Limiter {
             if d < Duration::from_millis(1) {
                 d = Duration::from_millis(1);
             }
+            // 睡眠要分段：别一睡几分钟~几天，害得取消/暂停迟迟不生效
+            if d > Duration::from_millis(200) {
+                d = Duration::from_millis(200);
+            }
             std::thread::sleep(d);
         }
     }

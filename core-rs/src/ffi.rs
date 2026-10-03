@@ -141,10 +141,13 @@ pub struct dc_engine {
 }
 
 /// 进下载时置忙、离开时自动复位（任何提前返回都会复位）。
-struct BusyGuard<'a>(&'a AtomicBool);
+/// 结束时也清掉 cancel/pause：避免"上一个任务的迟到取消"误伤下一个任务。
+struct BusyGuard<'a>(&'a dc_engine);
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.cancel.store(false, Ordering::SeqCst);
+        self.0.pause.store(false, Ordering::SeqCst);
+        self.0.busy.store(false, Ordering::SeqCst);
     }
 }
 
@@ -391,7 +394,7 @@ pub unsafe extern "C" fn dc_engine_download(
             if e.busy.swap(true, Ordering::SeqCst) {
                 return Err((DC_ERR_BUSY, "引擎正忙：同一个句柄不支持并发下载".to_string()));
             }
-            let _busy = BusyGuard(&e.busy);
+            let _busy = BusyGuard(e);
             // 每次下载前复位取消/暂停标志
             e.cancel.store(false, Ordering::SeqCst);
             e.pause.store(false, Ordering::SeqCst);
