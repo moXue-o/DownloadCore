@@ -288,7 +288,7 @@ impl NetClient {
             if matches!(status, 301 | 302 | 303 | 307 | 308) && !loc.is_empty() {
                 let next = resolve(&u, loc);
                 // 拒绝从 HTTPS 降级到 HTTP（内容会被明文传输、可被篡改）
-                if base.https && parse_url(&next).map(|nu| !nu.https).unwrap_or(false) {
+                if u.https && parse_url(&next).map(|nu| !nu.https).unwrap_or(false) {
                     return Err(fatal("redirect", "拒绝从 HTTPS 降级到 HTTP"));
                 }
                 self.stat_follows.fetch_add(1, Ordering::Relaxed);
@@ -1054,6 +1054,8 @@ mod tests {
         assert_eq!(crate::backend::strip_userinfo("https://u:p@h/f"), "https://h/f");
         assert_eq!(crate::backend::strip_userinfo("http://h/f"), "http://h/f");
         assert_eq!(crate::backend::strip_userinfo("http://h/a@b/c"), "http://h/a@b/c");
+        assert_eq!(crate::backend::strip_userinfo("http://h?email=a@b"), "http://h?email=a@b");
+        assert_eq!(crate::backend::strip_userinfo("http://h#a@b"), "http://h#a@b");
     }
 
     #[test]

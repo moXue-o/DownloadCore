@@ -495,9 +495,13 @@ impl Engine {
 
         if let Some(st) = store::load_state_file(&temp_dir.join(STATE_FILE_NAME)) {
             let has_validator = !pi.etag.is_empty() || !pi.last_modified.is_empty();
-            // 输出文件长度必须仍是当初预分配的满长（被单线程模式截断重写过就不能续传）
-            let marker_len_ok =
-                marker.metadata().map(|m| m.len() == pi.size as u64).unwrap_or(false);
+            // 输出文件长度校验：预分配过就要求满长；超大文件（跳过预分配）只要求不超过声明长
+            let marker_len = marker.metadata().map(|m| m.len()).unwrap_or(0);
+            let marker_len_ok = if pi.size <= MAX_PREALLOC {
+                marker_len == pi.size as u64
+            } else {
+                marker_len <= pi.size as u64
+            };
             let matches = st.version == 1
                 && st.url == shared.url()
                 && st.total == pi.size
@@ -873,7 +877,6 @@ fn move_into_place(src: &Path, final_path: &Path) -> Result<()> {
     fs::rename(src, final_path).map_err(|e| fatal("rename", format!("改名失败: {e}")))
 }
 
-/// 把最终路径归一化成稳定 key：Windows 大小写不敏感 → 统一小写，/// 避免同一个文件因大小写不同被当成两个（并发写坏 / 临时目录分裂）。
 /// 建目录（Unix 下权限收紧为 0700，避免临时目录被同机其他用户读写/投毒）。
 fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -887,6 +890,8 @@ fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// 把最终路径归一化成稳定 key：Windows 大小写不敏感 → 统一小写，
+/// 避免同一个文件因大小写不同被当成两个（并发写坏 / 临时目录分裂）。
 fn target_key(path: &Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let s = abs.display().to_string();

@@ -85,7 +85,8 @@ pub fn same_origin(a: &str, b: &str) -> bool {
 pub fn strip_userinfo(url: &str) -> String {
     if let Some((scheme, rest)) = url.split_once("://") {
         if let Some(i) = rest.find('@') {
-            if !rest[..i].contains('/') {
+            // 只有 '@' 在 authority 内（首个 '/', '?', '#' 之前）才算 userinfo
+            if !rest[..i].contains(['/', '?', '#']) {
                 return format!("{scheme}://{}", &rest[i + 1..]);
             }
         }
