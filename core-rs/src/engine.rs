@@ -134,8 +134,7 @@ impl Engine {
 
     /// 下载一个文件。阻塞式接口。
     /// 取消 / 暂停通过 `Request` 里的共享标志（可从别的线程调用）。
-    pub fn download(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {
-        if req.url.is_empty() {
+    pub fn download(&self, req: Request, cbs: Callbacks) -> Result<DownloadResult> {        if req.url.is_empty() {
             return Err(fatal("request", "URL 为空"));
         }
         // LTS 后端内部用 block_on / blocking_recv；若宿主自己在异步运行时里调用，
@@ -268,6 +267,10 @@ impl Engine {
                 return Err(fatal("whole", "实际下载字节数与声明大小不符（可能被截断）"));
             }
             shared.logf("INFO", format!("网络统计：{}", self.backend.stats()));
+            if let Err(e) = self.verify_checksum(&shared, &marker, &req.expected_sha256) {
+                shared.status(Status::Failed);
+                return Err(e);
+            }
             if let Err(e) = move_into_place(&marker, &final_path) {
                 shared.status(Status::Failed);
                 return Err(e);
@@ -307,6 +310,12 @@ impl Engine {
         }
 
         shared.status(Status::Downloading);
+        if shared.if_range_value().is_none() {
+            shared.logf(
+                "WARN",
+                "服务器未提供 ETag/Last-Modified：分段下载无法做内容一致性校验（如需强保证，请提供 expected_sha256）",
+            );
+        }
 
         let mut workers = Workers::new(&shared);
         let mut last_state_save = Instant::now();
@@ -449,6 +458,10 @@ impl Engine {
         // 全部下完 → 直接把 .part 改名成正式文件（无拼装）
         let n_segments = { shared.parts.lock().len() };
         shared.status(Status::Assembling);
+        if let Err(e) = self.verify_checksum(&shared, &marker, &req.expected_sha256) {
+            shared.status(Status::Failed);
+            return Err(e);
+        }
         if let Err(e) = move_into_place(&marker, &final_path) {
             shared.logf("ERROR", format!("改名失败：{e}"));
             shared.status(Status::Failed);
@@ -510,6 +523,28 @@ impl Engine {
             }
         }
         Ok((final_path, temp_dir))
+    }
+
+    /// 宿主给了期望 SHA-256 时，下完核对输出文件；不符则判失败、不改名（防静默损坏）。
+    fn verify_checksum(
+        &self,
+        shared: &Arc<Shared>,
+        marker: &Path,
+        expected: &Option<String>,
+    ) -> Result<()> {
+        let Some(exp) = expected else { return Ok(()) };
+        let exp = exp.trim();
+        if exp.is_empty() {
+            return Ok(());
+        }
+        let got = crate::util::sha256_file(marker)
+            .map_err(|e| fatal("checksum", format!("计算校验和失败: {e}")))?;
+        if !got.eq_ignore_ascii_case(exp) {
+            shared.logf("ERROR", format!("校验和不符：期望 {exp}，实际 {got}"));
+            return Err(fatal("checksum", format!("校验和不符：期望 {exp}，实际 {got}")));
+        }
+        shared.logf("INFO", format!("校验和通过：{got}"));
+        Ok(())
     }
 
     fn prepare_parts(
@@ -1140,7 +1175,14 @@ fn download_part_once(
         if let Some(v) = shared.if_range_value() {
             headers.push(("If-Range".to_string(), v));
         }
-        let body = match be.open_range(&ep, &headers, current, to) {
+        // 复核期望：总长 + 验证器
+        let (etag, last_mod) = { (shared.etag.lock().clone(), shared.last_mod.lock().clone()) };
+        let expect = crate::backend::RangeCheck {
+            etag: &etag,
+            last_modified: &last_mod,
+            total: shared.total.load(Ordering::SeqCst),
+        };
+        let body = match be.open_range(&ep, &headers, current, to, &expect) {
             Ok(b) => b,
             Err(e) => {
                 shared.logf(

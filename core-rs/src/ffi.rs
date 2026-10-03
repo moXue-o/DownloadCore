@@ -132,6 +132,8 @@ pub struct dc_request {
     pub header_count: usize,
     pub mirror_urls: *const *const c_char,
     pub mirror_count: usize,
+    /// 期望的 SHA-256（可选，NULL=不校验）；给了就必须匹配，否则判失败
+    pub expected_sha256: *const c_char,
 }
 
 pub type dc_progress_cb = Option<extern "C" fn(userdata: *mut c_void, p: *const dc_progress)>;
@@ -437,6 +439,7 @@ pub unsafe extern "C" fn dc_engine_download(
                 cancel: Some(e.cancel.clone()),
                 pause: Some(e.pause.clone()),
                 mirrors,
+                expected_sha256: cstr_to_string(r.expected_sha256),
             };
 
             let ud = userdata as usize;
@@ -518,7 +521,7 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_result, range_ok), 32);
 
         assert_eq!(align_of::<dc_request>(), 8);
-        assert_eq!(size_of::<dc_request>(), 64);
+        assert_eq!(size_of::<dc_request>(), 72);
         assert_eq!(offset_of!(dc_request, url), 0);
         assert_eq!(offset_of!(dc_request, target_file), 8);
         assert_eq!(offset_of!(dc_request, target_dir), 16);
@@ -527,6 +530,7 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_request, header_count), 40);
         assert_eq!(offset_of!(dc_request, mirror_urls), 48);
         assert_eq!(offset_of!(dc_request, mirror_count), 56);
+        assert_eq!(offset_of!(dc_request, expected_sha256), 64);
 
         assert_eq!(align_of::<dc_config>(), 8);
         assert_eq!(size_of::<dc_config>(), 72);

@@ -15,7 +15,7 @@
 //!
 //! 这里只负责"把 HTTP 说明白"；分段、续传、看门狗、写文件等仍由引擎负责。
 
-use crate::backend::{redact_sensitive, same_origin, Backend, Endpoint};
+use crate::backend::{redact_sensitive, same_origin, Backend, Endpoint, RangeCheck};
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
 use std::collections::HashMap;
@@ -165,22 +165,22 @@ impl NetClient {
         Ok(info)
     }
 
-    /// 打开某一段并"对暗号"：状态必须 206，返回起点必须等于 from。
+    /// 打开某一段并"对暗号"：状态必须 206，起点必须等于 from；再复核 `expect` 的总长/验证器。
     pub fn open_range(
         &self,
         t: &Target,
         headers: &[(String, String)],
         from: i64,
         to: i64,
+        expect: &RangeCheck,
     ) -> Result<Body> {
         let (status, hdrs, body) = self.request(&t.url, t.ip, headers, Some((from, to)))?;
         if status != 206 {
-            // 缓存的真实地址若失效（过期签名页可能回 200），清掉让下次重新解析
             self.clear_final(&cache_key(&t.url, t.ip));
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_get(&hdrs, "content-range");
-        let (start, _, _) = match parse_content_range(cr) {
+        let (start, _end, total) = match parse_content_range(cr) {
             Some(x) => x,
             None => {
                 self.clear_final(&cache_key(&t.url, t.ip));
@@ -193,6 +193,27 @@ impl NetClient {
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 期望起点 {from}，服务器给了 {start}"),
             ));
+        }
+        // 复核总长/验证器：堵"诚实服务器中途换了内容或换了个来源"
+        if expect.total > 0 && total > 0 && total != expect.total {
+            self.clear_final(&cache_key(&t.url, t.ip));
+            return Err(retryable(
+                "range",
+                format!("{ERR_RANGE_MISMATCH}: 总长变了（探路 {}，现在 {total}）", expect.total),
+            ));
+        }
+        let re = header_get(&hdrs, "etag");
+        if !expect.etag.is_empty() && !re.is_empty() && !re.eq_ignore_ascii_case(expect.etag) {
+            self.clear_final(&cache_key(&t.url, t.ip));
+            return Err(retryable(
+                "range",
+                format!("{ERR_RANGE_MISMATCH}: ETag 变了（探路 {}，现在 {re}）", expect.etag),
+            ));
+        }
+        let rl = header_get(&hdrs, "last-modified");
+        if !expect.last_modified.is_empty() && !rl.is_empty() && rl != expect.last_modified {
+            self.clear_final(&cache_key(&t.url, t.ip));
+            return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: Last-Modified 变了")));
         }
         Ok(body)
     }
@@ -1051,8 +1072,9 @@ impl Backend for NetClient {
         headers: &[(String, String)],
         from: i64,
         to: i64,
+        expect: &RangeCheck,
     ) -> Result<Box<dyn Read + Send>> {
-        Ok(Box::new(NetClient::open_range(self, &to_target(ep), headers, from, to)?))
+        Ok(Box::new(NetClient::open_range(self, &to_target(ep), headers, from, to, expect)?))
     }
 
     fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>> {

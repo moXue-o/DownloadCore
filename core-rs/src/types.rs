@@ -57,6 +57,8 @@ pub struct Request {
     pub pause: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 镜像地址（同一文件的其它来源）；可与主地址并行，用来突破单源限速
     pub mirrors: Vec<String>,
+    /// 期望的 SHA-256（十六进制）；给了它，文件下完后必须匹配，否则判失败（防静默损坏）
+    pub expected_sha256: Option<String>,
 }
 
 /// 下载成功后的结果。

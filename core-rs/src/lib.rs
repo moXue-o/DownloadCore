@@ -26,3 +26,4 @@ pub use config::{Config, DEFAULT_USER_AGENT};
 pub use engine::Engine;
 pub use errors::{Error, ErrorKind, Result};
 pub use types::{Callbacks, DownloadResult, LogEntry, Progress, Request, Status};
+pub use util::{sha256_file, to_hex, Sha256};

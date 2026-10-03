@@ -6,6 +6,7 @@
 mod common;
 
 use common::{make_data, TestServer};
+use downloadcore::backend::RangeCheck;
 use downloadcore::netclient::{NetClient, Target};
 use downloadcore::ErrorKind;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -61,7 +62,7 @@ fn open_range_reads_exact_bytes() {
     let srv = TestServer::new(data.clone());
     let (from, to) = (1000i64, 5000i64);
 
-    let body = client().open_range(&Target::new(srv.url()), &[], from, to).unwrap();
+    let body = client().open_range(&Target::new(srv.url()), &[], from, to, &RangeCheck::none()).unwrap();
     let got = read_all(body);
 
     assert_eq!(got.len() as i64, to - from + 1);
@@ -73,12 +74,32 @@ fn range_mismatch_is_detected() {
     let srv = TestServer::new(make_data(100_000, 5));
     srv.set_fail_range(true); // 服务器故意把起点报错 1 个字节
 
-    let err = match client().open_range(&Target::new(srv.url()), &[], 0, 2000) {
+    let err = match client().open_range(&Target::new(srv.url()), &[], 0, 2000, &RangeCheck::none()) {
         Ok(_) => panic!("服务器给错起点，应当报对暗号失败"),
         Err(e) => e,
     };
     assert!(err.is_retryable());
     assert!(err.message.contains("不一致"), "错误信息应指出对暗号失败: {}", err.message);
+}
+
+#[test]
+fn open_range_detects_validator_change() {
+    let data = make_data(1 << 20, 26);
+    let srv = TestServer::new(data.clone());
+    let c = client();
+    let t = Target::new(srv.url());
+    let info = c.probe(&t, &[]).unwrap();
+    assert_eq!(info.etag, "\"v1\"");
+
+    // 探路之后内容/ETag 变了：分段请求必须能检出，而不是把新内容拼进去
+    srv.set_data(data.clone(), "\"v2\"");
+    let expect = RangeCheck {
+        etag: &info.etag,
+        last_modified: &info.last_modified,
+        total: info.size,
+    };
+    let r = c.open_range(&t, &[], 0, 1000, &expect);
+    assert!(r.is_err(), "ETag 变了应报错");
 }
 
 #[test]
@@ -105,7 +126,7 @@ fn chunked_range_is_decoded() {
     let srv = TestServer::new(data.clone());
     srv.set_chunked(true);
 
-    let body = client().open_range(&Target::new(srv.url()), &[], 100, 999).unwrap();
+    let body = client().open_range(&Target::new(srv.url()), &[], 100, 999, &RangeCheck::none()).unwrap();
     let got = read_all(body);
     assert_eq!(got, data[100..1000]);
 }

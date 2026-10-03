@@ -539,6 +539,48 @@ fn setup_failure_reports_failed_status() {
 }
 
 #[test]
+fn checksum_verified_before_rename() {
+    let data = make_data(1 << 20, 25);
+    let srv = TestServer::new(data.clone());
+    let dir = unique_dir("sha");
+    let out = dir.join("out.bin");
+    let engine = Engine::new(test_config(&dir));
+    let mut h = downloadcore::Sha256::new();
+    h.update(&data);
+    let good = downloadcore::to_hex(&h.finish());
+
+    // 正确的校验和 → 成功
+    let res = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                expected_sha256: Some(good),
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap();
+    assert_eq!(read_file(&res.path), data);
+
+    // 错误的校验和 → 失败，且不改名
+    std::fs::remove_file(&out).ok();
+    let err = engine
+        .download(
+            Request {
+                url: srv.url(),
+                target_file: Some(out.display().to_string()),
+                expected_sha256: Some("deadbeef".to_string()),
+                ..Default::default()
+            },
+            Callbacks::default(),
+        )
+        .unwrap_err();
+    assert!(err.message.contains("校验和"), "应报校验和不符: {}", err.message);
+    assert!(!out.exists(), "校验失败不应产出正式文件");
+}
+
+#[test]
 fn cancel_during_read_error_is_canceled_not_failed() {
     let data = make_data(2 << 20, 24);
     let srv = TestServer::new(data);

@@ -31,19 +31,35 @@ pub struct Endpoint {
     pub label: String,
 }
 
+/// 分段请求的"期望值"：用于在收到 206 后复核服务器给的验证器/总长（堵"中途换内容/换来源"）。
+#[derive(Clone, Copy, Default)]
+pub struct RangeCheck<'a> {
+    pub etag: &'a str,
+    pub last_modified: &'a str,
+    /// 探路得到的总大小（0=未知，不校验）
+    pub total: i64,
+}
+
+impl RangeCheck<'_> {
+    pub fn none() -> RangeCheck<'static> {
+        RangeCheck { etag: "", last_modified: "", total: 0 }
+    }
+}
+
 /// "上网"这件事的抽象。实现必须可跨线程共享。
 pub trait Backend: Send + Sync {
     /// 后端名字，日志用。
     fn name(&self) -> &'static str;
     /// 探路：文件多大、能不能分段、ETag 等。带上传入的额外请求头（Cookie/鉴权等）。
     fn probe(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<ProbeInfo>;
-    /// 打开某一段的字节流（内部需"对暗号"，起点必须一致）。
+    /// 打开某一段的字节流（内部需"对暗号"，并复核 `expect` 里的验证器/总长）。
     fn open_range(
         &self,
         ep: &Endpoint,
         headers: &[(String, String)],
         from: i64,
         to: i64,
+        expect: &RangeCheck,
     ) -> Result<Box<dyn Read + Send>>;
     /// 整文件不分段的字节流。
     fn open_plain(&self, ep: &Endpoint, headers: &[(String, String)]) -> Result<Box<dyn Read + Send>>;
@@ -160,14 +176,24 @@ fn sources_for(cfg: &Config, url: &str) -> Vec<Endpoint> {
     vec![Endpoint { url: url.to_string(), ip: None, label: "default".to_string() }]
 }
 
-/// 两个来源算不算"同一个文件"：大小、分段支持一致，且**至少有一个身份证（ETag 或
+/// 弱 ETag（`W/"..."`）不能当强校验器用：这里把它视为"没有 ETag"。
+fn strong_etag(e: &str) -> &str {
+    if e.trim_start().starts_with("W/") {
+        ""
+    } else {
+        e
+    }
+}
+
+/// 两个来源算不算"同一个文件"：大小、分段支持一致，且**至少有一个身份证（强 ETag 或
 /// Last-Modified）非空并相等**。没有身份证就只比大小太危险（同大小不同内容会拼坏文件）。
 fn same_file(a: &ProbeInfo, b: &ProbeInfo) -> bool {
     if a.size != b.size || a.range_ok != b.range_ok {
         return false;
     }
-    if !a.etag.is_empty() && !b.etag.is_empty() {
-        return a.etag == b.etag;
+    let (ea, eb) = (strong_etag(&a.etag), strong_etag(&b.etag));
+    if !ea.is_empty() && !eb.is_empty() {
+        return ea == eb;
     }
     if !a.last_modified.is_empty() && !b.last_modified.is_empty() {
         return a.last_modified == b.last_modified;

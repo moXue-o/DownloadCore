@@ -99,6 +99,7 @@ typedef struct dc_request {
     size_t header_count;
     const char* const* mirror_urls;   /* 镜像地址（同一文件），可 NULL */
     size_t mirror_count;
+    const char* expected_sha256;      /* 期望的 SHA-256（十六进制，可 NULL=不校验；给了就必须匹配） */
 } dc_request;
 
 typedef void (*dc_progress_cb)(void* userdata, const dc_progress* p);

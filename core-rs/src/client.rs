@@ -8,7 +8,9 @@
 //!   · 响应体走 channel **流式**转给阻塞读（去掉"每块 block_on"）；
 //!   · **记住跳转后的真实地址**，后面分段直接打过去（省掉每一跳）。
 
-use crate::backend::{host_of, port_of, redact_sensitive, same_origin, Backend, Endpoint, ProbeInfo};
+use crate::backend::{
+    host_of, port_of, redact_sensitive, same_origin, Backend, Endpoint, ProbeInfo, RangeCheck,
+};
 use crate::config::Config;
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
 use crate::util::{parse_content_range, parse_filename};
@@ -267,6 +269,7 @@ impl Backend for LtsBackend {
         headers: &[(String, String)],
         from: i64,
         to: i64,
+        expect: &RangeCheck,
     ) -> Result<Box<dyn Read + Send>> {
         let resp = self.get(ep, headers, Some((from, to)))?;
 
@@ -276,7 +279,7 @@ impl Backend for LtsBackend {
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_str(&resp, "content-range");
-        let (start, _, _) = match parse_content_range(&cr) {
+        let (start, _end, total) = match parse_content_range(&cr) {
             Some(x) => x,
             None => {
                 self.clear_final(&cache_key(&ep.url, ep.ip));
@@ -289,6 +292,27 @@ impl Backend for LtsBackend {
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 期望起点 {from}，服务器给了 {start}"),
             ));
+        }
+        // 复核总长/验证器：堵"诚实服务器中途换了内容或换了个来源"
+        if expect.total > 0 && total > 0 && total != expect.total {
+            self.clear_final(&cache_key(&ep.url, ep.ip));
+            return Err(retryable(
+                "range",
+                format!("{ERR_RANGE_MISMATCH}: 总长变了（探路 {}，现在 {total}）", expect.total),
+            ));
+        }
+        let re = header_str(&resp, "etag");
+        if !expect.etag.is_empty() && !re.is_empty() && !re.eq_ignore_ascii_case(expect.etag) {
+            self.clear_final(&cache_key(&ep.url, ep.ip));
+            return Err(retryable(
+                "range",
+                format!("{ERR_RANGE_MISMATCH}: ETag 变了（探路 {}，现在 {re}）", expect.etag),
+            ));
+        }
+        let rl = header_str(&resp, "last-modified");
+        if !expect.last_modified.is_empty() && !rl.is_empty() && rl != expect.last_modified {
+            self.clear_final(&cache_key(&ep.url, ep.ip));
+            return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: Last-Modified 变了")));
         }
         Ok(Box::new(self.body(resp)))
     }
