@@ -647,7 +647,6 @@ fn read_mode(inner: &mut BufReader<Stream>, mode: &mut Mode, buf: &mut [u8]) -> 
                         }
                         continue;
                     }
-                    empty_lines = 0;
                     let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
                         .map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidData, format!("chunk 大小不合法: {line}"))
