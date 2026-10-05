@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <assert.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -97,6 +98,29 @@ typedef struct dc_request {
     size_t header_count;
     const char* expected_sha256;      /* 期望的 SHA-256（十六进制，可 NULL=不校验；给了就必须匹配） */
 } dc_request;
+
+/*
+ * 布局守护：与 Rust 侧（src/ffi.rs 的 offset 断言）呼应，任何 C 消费者都会自动校验。
+ * 仅按 64 位 ABI 校验（本项目以 64 位交付）；编译器不支持 static_assert 时自动跳过。
+ */
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L) \
+    || (defined(_MSC_VER) && _MSC_VER >= 1920)
+#  define DC_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#  define DC_STATIC_ASSERT(cond, msg) /* 跳过 */
+#endif
+
+#if defined(_WIN64) || defined(__LP64__) || defined(_LP64)
+DC_STATIC_ASSERT(sizeof(dc_progress) == 32, "dc_progress size");
+DC_STATIC_ASSERT(sizeof(dc_result) == 40, "dc_result size");
+DC_STATIC_ASSERT(sizeof(dc_config) == 64, "dc_config size");
+DC_STATIC_ASSERT(sizeof(dc_request) == 48, "dc_request size");
+DC_STATIC_ASSERT(offsetof(dc_result, size) == 8, "dc_result.size offset");
+DC_STATIC_ASSERT(offsetof(dc_config, buffer_size) == 16, "dc_config.buffer_size offset");
+DC_STATIC_ASSERT(offsetof(dc_request, expected_sha256) == 40, "dc_request.expected_sha256 offset");
+#endif
+
+#undef DC_STATIC_ASSERT
 
 typedef void (*dc_progress_cb)(void* userdata, const dc_progress* p);
 typedef void (*dc_status_cb)(void* userdata, int status);

@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 编译时把 build 时间戳注入二进制，供程序显示、便于校对版本。
-/// - 若外部设置了环境变量 `BUILD_STAMP`（见 build.ps1），就用它；
+/// - 若外部设置了环境变量 `BUILD_STAMP`，就用它；
 /// - 否则（例如直接 `cargo build`）自动取当前 UTC 时间。
 fn main() {
     println!("cargo:rerun-if-env-changed=BUILD_STAMP");
