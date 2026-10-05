@@ -22,7 +22,6 @@ fn test_config(dir: &PathBuf) -> Config {
     c.idle_timeout = Duration::from_secs(3);
     c.max_retries = 2;
     c.retry_delay = Duration::from_millis(50);
-    c.adaptive_threads = false; // 测试默认固定并发，便于断言
     c
 }
 
@@ -239,53 +238,5 @@ fn pause_and_resume_completes_correctly() {
     assert_eq!(read_file(&res.path), data);
 }
 
-#[test]
-fn adaptive_threads_grow() {
-    let data = make_data(6 << 20, 10);
-    let srv = TestServer::new(data.clone());
-    srv.set_speed(1 << 20); // 每连接 1 MB/s，慢一点给自适应时间
-    let dir = unique_dir("adaptive");
-    let target = dir.join("out.bin");
-    let mut cfg = test_config(&dir);
-    cfg.initial_threads = 1;
-    cfg.max_threads = 8;
-    cfg.adaptive_threads = true;
-    let engine = Engine::new(cfg);
 
-    let t0 = std::time::Instant::now();
-    let res = engine
-        .download(
-            Request { url: srv.url(), target_file: Some(target.display().to_string()), ..Default::default() },
-            Callbacks::default(),
-        )
-        .unwrap();
-    let dt = t0.elapsed();
-    assert_eq!(read_file(&res.path), data);
-    assert!(res.parts >= 2, "自适应应当会加人，实际分段 {}，用时 {:?}", res.parts, dt);
-}
 
-#[test]
-fn mirrors_are_used() {
-    let data = make_data(2 << 20, 11);
-    let slow = TestServer::new(data.clone());
-    slow.set_speed(1 << 20); // 主源限速
-    let fast = TestServer::new(data.clone());
-    let dir = unique_dir("mirror");
-    let target = dir.join("out.bin");
-    let cfg = test_config(&dir);
-    let engine = Engine::new(cfg);
-
-    let res = engine
-        .download(
-            Request {
-                url: slow.url(),
-                target_file: Some(target.display().to_string()),
-                mirrors: vec![fast.url()],
-                ..Default::default()
-            },
-            Callbacks::default(),
-        )
-        .unwrap();
-    assert_eq!(read_file(&res.path), data);
-    assert!(fast.hits() > 1, "镜像应当真正被用于下载（不只是探路），hits={}", fast.hits());
-}

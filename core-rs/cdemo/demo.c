@@ -25,8 +25,8 @@
 
 /* 布局必须与 Rust 侧一致；对不上就编译报错，避免"静默内存错乱"。 */
 static_assert(sizeof(dc_progress) == 32, "dc_progress layout mismatch");
-static_assert(sizeof(dc_request) == 72, "dc_request layout mismatch");
-static_assert(sizeof(dc_config) == 72, "dc_config layout mismatch");
+static_assert(sizeof(dc_request) == 48, "dc_request layout mismatch");
+static_assert(sizeof(dc_config) == 64, "dc_config layout mismatch");
 static_assert(sizeof(dc_result) == 40, "dc_result layout mismatch");
 
 /* 字段偏移也要锁死（只锁大小会漏掉"同类型字段被对调"） */
@@ -35,7 +35,7 @@ static_assert(offsetof(dc_config, buffer_size) == 16, "dc_config.buffer_size off
 static_assert(offsetof(dc_config, idle_timeout_ms) == 20, "dc_config.idle_timeout_ms offset");
 static_assert(offsetof(dc_config, max_retries) == 24, "dc_config.max_retries offset");
 static_assert(offsetof(dc_config, retry_delay_ms) == 28, "dc_config.retry_delay_ms offset");
-static_assert(offsetof(dc_request, expected_sha256) == 64, "dc_request.expected_sha256 offset");
+static_assert(offsetof(dc_request, expected_sha256) == 40, "dc_request.expected_sha256 offset");
 static_assert(offsetof(dc_progress, total) == 8, "dc_progress.total offset");
 
 static FILE* g_log = NULL;
@@ -131,12 +131,30 @@ static int do_download(dc_engine* e, const char* url, const char* dir) {
     dc_request req;
     dc_result  res;
     char*      err = NULL;
+    char       target[4096];
     int        rc;
 
     memset(&req, 0, sizeof(req));
     memset(&res, 0, sizeof(res));
     req.url = url;
-    req.target_dir = dir;
+    /* 核心不替宿主取名：这里自己取 URL 最后一段做文件名，拼到 dir 下 */
+    {
+        const char* q = strchr(url, '?');
+        const char* end = q ? q : url + strlen(url);
+        const char* slash = NULL;
+        const char* p;
+        for (p = url; p < end; p++) {
+            if (*p == '/') slash = p;
+        }
+        if (slash && slash + 1 < end) {
+            size_t len = (size_t)(end - (slash + 1));
+            if (len > 255) len = 255;
+            snprintf(target, sizeof target, "%s/%.*s", dir, (int)len, slash + 1);
+        } else {
+            snprintf(target, sizeof target, "%s/download.bin", dir);
+        }
+    }
+    req.target_file = target;
 
     logline("INFO", "开始下载：");
     logline("INFO", url);

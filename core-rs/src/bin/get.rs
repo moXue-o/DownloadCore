@@ -85,6 +85,15 @@ fn main() {
     }
 }
 
+/// 宿主自己从 URL 取文件名（核心不再替宿主取名）。
+fn target_path(dir: &std::path::Path, url: &str) -> PathBuf {
+    let after_host = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = after_host.split('?').next().unwrap_or(after_host);
+    let name = path.rsplit('/').next().unwrap_or("");
+    let name = if name.is_empty() { "download.bin" } else { name };
+    dir.join(name)
+}
+
 /// 一次真实下载：这就是"其他程序员调用引擎"的完整样子。
 fn run_one(logger: &Arc<Logger>, url: &str, dir: &PathBuf) -> i32 {
     // 1) 配置 + 造引擎
@@ -95,7 +104,7 @@ fn run_one(logger: &Arc<Logger>, url: &str, dir: &PathBuf) -> i32 {
     // 2) 装请求
     let req = Request {
         url: url.to_string(),
-        target_dir: Some(dir.display().to_string()), // 留空文件名 → 自动取名、下到当前目录
+        target_file: Some(target_path(dir, url).display().to_string()),
         ..Default::default()
     };
 
@@ -186,9 +195,10 @@ fn run_selftest(logger: &Arc<Logger>, dir: &PathBuf) {
     let mut cfg = Config::default();
     cfg.temp_dir = dir.join(".download-temp");
     let engine = Engine::new(cfg);
+    let tf = target_path(dir, &url).display().to_string();
     let req = Request {
         url,
-        target_dir: Some(dir.display().to_string()),
+        target_file: Some(tf),
         ..Default::default()
     };
 

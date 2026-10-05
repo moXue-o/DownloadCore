@@ -13,10 +13,9 @@ use crate::backend::{
 };
 use crate::config::Config;
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
-use crate::util::{parse_content_range, parse_filename};
+use crate::util::parse_content_range;
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,18 +65,14 @@ impl LtsBackend {
         })
     }
 
-    fn client_for(&self, url: &str, ip: Option<IpAddr>) -> Result<reqwest::Client> {
+    fn client_for(&self, url: &str) -> Result<reqwest::Client> {
         let host = host_of(url).unwrap_or_default();
         let scheme = if url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
             "https"
         } else {
             "http"
         };
-        let key = format!(
-            "{scheme}://{host}:{}|{}",
-            port_of(url),
-            ip.map(|i| i.to_string()).unwrap_or_default()
-        );
+        let key = format!("{scheme}://{host}:{}", port_of(url));
         if let Some(c) = self.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(c.clone());
         }
@@ -102,11 +97,6 @@ impl LtsBackend {
             .http1_only()
             // 不使用系统代理：代理属于宿主/系统的设置，应由宿主显式决定
             .no_proxy();
-        if let Some(ip) = ip {
-            if !host.is_empty() {
-                b = b.resolve(&host, SocketAddr::new(ip, port_of(url)));
-            }
-        }
         let client =
             b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
         let mut m = self.clients.lock().unwrap_or_else(|e| e.into_inner());
@@ -135,20 +125,19 @@ impl LtsBackend {
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<reqwest::Response> {
-        let ck = cache_key(&ep.url, ep.ip);
+        let ck = cache_key(&ep.url);
         let cached = self.cached_final(&ck);
-        let (url, ip, send_headers) = match &cached {
+        let (url, send_headers) = match &cached {
             Some(f) if f.as_str() != ep.url => {
                 self.stat_final_hits.fetch_add(1, Ordering::Relaxed);
                 let same = same_origin(&ep.url, f);
-                // 跨域：别把 Authorization/Cookie 发到跳转后的主机；同源则保留原 IP 绑定
+                // 跨域：别把 Authorization/Cookie 发到跳转后的主机
                 let hdrs = if same { headers.to_vec() } else { redact_sensitive(headers) };
-                let hop_ip = if same { ep.ip } else { None };
-                (f.clone(), hop_ip, hdrs)
+                (f.clone(), hdrs)
             }
-            _ => (ep.url.clone(), ep.ip, headers.to_vec()),
+            _ => (ep.url.clone(), headers.to_vec()),
         };
-        let client = self.client_for(&url, ip)?;
+        let client = self.client_for(&url)?;
         let ua = self.user_agent.clone();
         let resp = self
             .rt
@@ -206,9 +195,9 @@ impl LtsBackend {
     }
 }
 
-/// 跳转缓存键（含绑定的 IP，避免"多 IP 并行"被同一个跳转键覆盖）。
-fn cache_key(url: &str, ip: Option<IpAddr>) -> String {
-    format!("{url}|{}", ip.map(|i| i.to_string()).unwrap_or_default())
+/// 跳转缓存键。
+fn cache_key(url: &str) -> String {
+    url.to_string()
 }
 
 fn reqwest_to_io(e: reqwest::Error) -> io::Error {
@@ -235,13 +224,12 @@ impl Backend for LtsBackend {
         let status = resp.status().as_u16();
         let etag = header_str(&resp, "etag");
         let last_modified = header_str(&resp, "last-modified");
-        let file_name = parse_filename(&header_str(&resp, "content-disposition"));
         let clen = resp.content_length().map(|v| v.min(i64::MAX as u64) as i64).unwrap_or(0);
         let content_range = header_str(&resp, "content-range");
         let accept_ranges = header_str(&resp, "accept-ranges");
         drop(resp);
 
-        let mut info = ProbeInfo { size: 0, range_ok: false, etag, last_modified, file_name };
+        let mut info = ProbeInfo { size: 0, range_ok: false, etag, last_modified };
         if status == 206 {
             if let Some((start, _end, total)) = parse_content_range(&content_range) {
                 // 只有总长已知（非 `*`）才敢定 size
@@ -254,7 +242,7 @@ impl Backend for LtsBackend {
             info.range_ok = false;
             info.size = clen;
         } else {
-            self.clear_final(&cache_key(&ep.url, ep.ip)); // 缓存可能失效，下次重新解析
+            self.clear_final(&cache_key(&ep.url)); // 缓存可能失效，下次重新解析
             return Err(fatal("probe", format!("服务器返回状态 {status}")));
         }
         if accept_ranges.eq_ignore_ascii_case("none") {
@@ -275,19 +263,19 @@ impl Backend for LtsBackend {
 
         let status = resp.status().as_u16();
         if status != 206 {
-            self.clear_final(&cache_key(&ep.url, ep.ip));
+            self.clear_final(&cache_key(&ep.url));
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_str(&resp, "content-range");
         let (start, _end, total) = match parse_content_range(&cr) {
             Some(x) => x,
             None => {
-                self.clear_final(&cache_key(&ep.url, ep.ip));
+                self.clear_final(&cache_key(&ep.url));
                 return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: Content-Range 缺失")));
             }
         };
         if start != from {
-            self.clear_final(&cache_key(&ep.url, ep.ip));
+            self.clear_final(&cache_key(&ep.url));
             return Err(retryable(
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 期望起点 {from}，服务器给了 {start}"),
@@ -295,7 +283,7 @@ impl Backend for LtsBackend {
         }
         // 复核总长/验证器：堵"诚实服务器中途换了内容或换了个来源"
         if expect.total > 0 && total > 0 && total != expect.total {
-            self.clear_final(&cache_key(&ep.url, ep.ip));
+            self.clear_final(&cache_key(&ep.url));
             return Err(retryable(
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 总长变了（探路 {}，现在 {total}）", expect.total),
@@ -309,7 +297,7 @@ impl Backend for LtsBackend {
             && (!re.is_empty() || !rl.is_empty())
             && !crate::backend::validators_compatible(expect.etag, expect.last_modified, &re, &rl)
         {
-            self.clear_final(&cache_key(&ep.url, ep.ip));
+            self.clear_final(&cache_key(&ep.url));
             return Err(retryable(
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 验证器变了（ETag '{re}' / Last-Modified '{rl}'）"),
@@ -323,7 +311,7 @@ impl Backend for LtsBackend {
         let status = resp.status().as_u16();
         // 204/205 是"无内容"，不能当成功空文件
         if !(200..300).contains(&status) || status == 204 || status == 205 {
-            self.clear_final(&cache_key(&ep.url, ep.ip));
+            self.clear_final(&cache_key(&ep.url));
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
         Ok(Box::new(self.body(resp)))

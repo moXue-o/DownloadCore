@@ -32,10 +32,6 @@ pub struct Config {
     pub user_agent: String,
     /// 全局限速（字节/秒），0 表示不限
     pub max_speed: u64,
-    /// 自适应并发：只增不减地"爬坡"到 max_threads（不做速度反馈；false 则固定用 max_threads）
-    pub adaptive_threads: bool,
-    /// 把域名解析成多个 IP 并行使用（可绕过"单 IP 限速"）
-    pub use_multiple_ips: bool,
 }
 
 impl Default for Config {
@@ -53,9 +49,6 @@ impl Default for Config {
             incomplete_suffix: ".part".to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_speed: 0,
-            // 默认像 AB 一样用固定并发；需要"只增不减爬坡"时再打开
-            adaptive_threads: false,
-            use_multiple_ips: true,
         }
     }
 }

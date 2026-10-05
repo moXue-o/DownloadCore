@@ -8,10 +8,6 @@
 use crate::config::Config;
 use crate::errors::{retryable, Error, Result};
 use std::io::Read;
-use std::net::{IpAddr, ToSocketAddrs};
-
-/// 每个域名最多并行使用的 IP 数。
-pub const MAX_IPS_PER_HOST: usize = 4;
 
 /// 探路结果（两个后端共用同一形状）。
 #[derive(Debug, Clone)]
@@ -20,18 +16,12 @@ pub struct ProbeInfo {
     pub range_ok: bool,
     pub etag: String,
     pub last_modified: String,
-    pub file_name: String,
 }
 
-/// 一个下载来源：网址 +（可选）绑定到某个 IP + 日志标签 + 探路得到的验证器。
+/// 下载目标：就一个网址。核心不做"多来源/多 IP 并行"。
 #[derive(Clone, Debug)]
 pub struct Endpoint {
     pub url: String,
-    pub ip: Option<IpAddr>,
-    pub label: String,
-    /// 该来源探路得到的验证器（用于给"这个来源"发 If-Range 与逐段复核）
-    pub etag: String,
-    pub last_modified: String,
 }
 
 /// 分段请求的"期望值"：用于在收到 206 后复核服务器给的验证器/总长（堵"中途换内容/换来源"）。
@@ -149,48 +139,6 @@ pub fn port_of(url: &str) -> u16 {
     }
 }
 
-/// 把主机名解析成多个 IP；优先 IPv4。
-pub fn resolve_ips(host: &str) -> Vec<IpAddr> {
-    let mut v: Vec<IpAddr> = (host, 0u16)
-        .to_socket_addrs()
-        .map(|it| it.map(|a| a.ip()).collect())
-        .unwrap_or_default();
-    v.sort_by_key(|a| a.is_ipv6());
-    // 去重（不能只用 dedup：排序只保证同族相邻，重复项未必相邻）
-    let mut seen = std::collections::HashSet::new();
-    v.retain(|ip| seen.insert(*ip));
-    v.truncate(MAX_IPS_PER_HOST);
-    v
-}
-
-/// 为一个 URL 建来源：多 IP 则每个 IP 一个来源，否则单个未绑定来源。
-fn sources_for(cfg: &Config, url: &str) -> Vec<Endpoint> {
-    if cfg.use_multiple_ips {
-        if let Some(host) = host_of(url) {
-            let ips = resolve_ips(&host);
-            if ips.len() > 1 {
-                return ips
-                    .into_iter()
-                    .map(|ip| Endpoint {
-                        url: url.to_string(),
-                        ip: Some(ip),
-                        label: ip.to_string(),
-                        etag: String::new(),
-                        last_modified: String::new(),
-                    })
-                    .collect();
-            }
-        }
-    }
-    vec![Endpoint {
-        url: url.to_string(),
-        ip: None,
-        label: "default".to_string(),
-        etag: String::new(),
-        last_modified: String::new(),
-    }]
-}
-
 /// 弱 ETag（`W/"..."`）不能当强校验器用：这里把它视为"没有 ETag"。
 pub fn strong_etag(e: &str) -> &str {
     if e.trim_start().starts_with("W/") {
@@ -221,73 +169,24 @@ pub fn validators_compatible(
     false
 }
 
-/// 给某个来源发 If-Range 时用的值（优先强 ETag，其次 Last-Modified；弱 ETag 不用）。
-pub fn if_range_value(etag: &str, last_modified: &str) -> Option<String> {
-    let s = strong_etag(etag);
-    if !s.is_empty() {
-        return Some(s.to_string());
-    }
-    if !last_modified.is_empty() {
-        return Some(last_modified.to_string());
-    }
-    None
-}
-
-/// 两个来源算不算"同一个文件"：大小、分段支持一致，且验证器相容。
-fn same_file(a: &ProbeInfo, b: &ProbeInfo) -> bool {
-    if a.size != b.size || a.range_ok != b.range_ok {
-        return false;
-    }
-    validators_compatible(&a.etag, &a.last_modified, &b.etag, &b.last_modified)
-}
-
-fn with_validator(ep: &Endpoint, pi: &ProbeInfo) -> Endpoint {
-    let mut e = ep.clone();
-    e.etag = pi.etag.clone();
-    e.last_modified = pi.last_modified.clone();
-    e
-}
-
-/// 建来源池并探路。镜像只有"与主源是同一文件"才被采纳。
-///
-/// 探路本身也会重试：依次试池里所有地址，失败就换下一个；全都不行再等一会儿重来。
-/// （探路失败=整个任务失败，所以不能"只试一次"。两个后端共用此逻辑。）
-pub fn build_pool(
+/// 探路（带重试）。探路失败 = 整个任务失败，所以不能只试一次。
+pub fn probe_target(
     be: &dyn Backend,
     cfg: &Config,
-    primary: &str,
-    mirrors: &[String],
+    url: &str,
     headers: &[(String, String)],
     canceled: &dyn Fn() -> bool,
-    log: &dyn Fn(&str),
-) -> Result<(Vec<Endpoint>, ProbeInfo)> {
-    let eps = sources_for(cfg, primary);
+) -> Result<ProbeInfo> {
+    let ep = Endpoint { url: url.to_string() };
     let rounds = cfg.max_retries.clamp(1, 3);
-    let mut healthy: Vec<Endpoint> = Vec::new();
-    let mut info: Option<ProbeInfo> = None;
     let mut last_err = None;
-    'outer: for r in 0..rounds {
-        healthy.clear();
-        for ep in eps.iter() {
-            if canceled() {
-                return Err(Error::canceled());
-            }
-            match be.probe(ep, headers) {
-                Ok(pi) => {
-                    if info.is_none() {
-                        let e2 = with_validator(ep, &pi);
-                        healthy.push(e2); // 第一个成功来源
-                        info = Some(pi);
-                    } else if same_file(info.as_ref().unwrap(), &pi) {
-                        // 其余 IP 也必须确认是"同一份文件"才采纳，否则不混拼
-                        healthy.push(with_validator(ep, &pi));
-                    }
-                }
-                Err(e) => last_err = Some(e),
-            }
+    for r in 0..rounds {
+        if canceled() {
+            return Err(Error::canceled());
         }
-        if info.is_some() {
-            break 'outer;
+        match be.probe(&ep, headers) {
+            Ok(pi) => return Ok(pi),
+            Err(e) => last_err = Some(e),
         }
         if r + 1 < rounds {
             if canceled() {
@@ -296,91 +195,29 @@ pub fn build_pool(
             std::thread::sleep(cfg.retry_delay);
         }
     }
-    let info = match info {
-        Some(i) => i,
-        None => {
-            return Err(last_err.unwrap_or_else(|| retryable("probe", "探路失败：所有来源都不通")))
-        }
-    };
-    // 只保留探得通的来源；万一个都没记下（不该发生），退回未绑定来源
-    let mut eps = if healthy.is_empty() { sources_for(cfg, primary) } else { healthy };
-
-    for m in mirrors {
-        if m.trim().is_empty() {
-            continue;
-        }
-        if canceled() {
-            return Err(Error::canceled());
-        }
-        // 跨域镜像：别把 Authorization/Cookie 发过去
-        let m_headers: Vec<(String, String)> = if same_origin(primary, m) {
-            headers.to_vec()
-        } else {
-            redact_sensitive(headers)
-        };
-        // 逐个探，保留健康来源；**每个都要确认是同一文件**才纳入
-        let tmp = sources_for(cfg, m);
-        let mut ok_mirror: Vec<Endpoint> = Vec::new();
-        let mut mirror_info: Option<ProbeInfo> = None;
-        for ep in tmp.iter() {
-            if canceled() {
-                return Err(Error::canceled());
-            }
-            if let Ok(pi) = be.probe(ep, &m_headers) {
-                match &mirror_info {
-                    None => {
-                        // 先确认镜像与主源是同一文件，再作为该镜像的基准
-                        if same_file(&info, &pi) {
-                            let e2 = with_validator(ep, &pi);
-                            mirror_info = Some(pi);
-                            ok_mirror.push(e2);
-                        }
-                    }
-                    Some(base) => {
-                        if same_file(base, &pi) {
-                            ok_mirror.push(with_validator(ep, &pi));
-                        }
-                    }
-                }
-            }
-        }
-        if ok_mirror.is_empty() {
-            log(&format!("镜像不可用或与主源不是同一文件，已跳过：{m}"));
-        } else {
-            eps.extend(ok_mirror);
-        }
-    }
-    Ok((eps, info))
+    Err(last_err.unwrap_or_else(|| retryable("probe", "探路失败")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pi(size: i64, etag: &str, lm: &str) -> ProbeInfo {
-        ProbeInfo {
-            size,
-            range_ok: true,
-            etag: etag.to_string(),
-            last_modified: lm.to_string(),
-            file_name: String::new(),
-        }
-    }
-
     #[test]
-    fn same_file_requires_validator() {
-        assert!(!same_file(&pi(10, "", ""), &pi(10, "", "")), "无身份证不认");
-        assert!(same_file(&pi(10, "\"a\"", ""), &pi(10, "\"a\"", "")));
-        assert!(!same_file(&pi(10, "\"a\"", ""), &pi(10, "\"b\"", "")));
-        // 强 ETag 优先且排他：强 ETag 不同 → 不认（即使 Last-Modified 相同）
-        assert!(!same_file(&pi(10, "\"a\"", "x"), &pi(10, "\"b\"", "x")));
-        // 弱 ETag：相同 → 相容；不同 → 即使 Last-Modified 相同也不认
-        assert!(same_file(&pi(10, "W/\"a\"", ""), &pi(10, "W/\"a\"", "")));
-        assert!(!same_file(&pi(10, "W/\"a\"", "x"), &pi(10, "W/\"b\"", "x")));
+    fn validators_compatible_rules() {
+        // 都缺 → 不相容（不认）
+        assert!(!validators_compatible("", "", "", ""));
+        // 强 ETag 相同/不同
+        assert!(validators_compatible("\"a\"", "", "\"a\"", ""));
+        assert!(!validators_compatible("\"a\"", "", "\"b\"", ""));
+        // 强 ETag 优先且排他：强 ETag 不同 → 不认（即便 Last-Modified 相同）
+        assert!(!validators_compatible("\"a\"", "x", "\"b\"", "x"));
         // 强 ETag 匹配即可（Last-Modified 不同也认）
-        assert!(same_file(&pi(10, "\"a\"", "x"), &pi(10, "\"a\"", "y")));
+        assert!(validators_compatible("\"a\"", "x", "\"a\"", "y"));
+        // 弱 ETag：相同 → 相容；不同 → 不认（即便 LM 相同）
+        assert!(validators_compatible("W/\"a\"", "", "W/\"a\"", ""));
+        assert!(!validators_compatible("W/\"a\"", "x", "W/\"b\"", "x"));
         // 无 ETag 时用 Last-Modified
-        assert!(same_file(&pi(10, "", "x"), &pi(10, "", "x")));
-        assert!(!same_file(&pi(10, "", "x"), &pi(10, "", "y")));
+        assert!(validators_compatible("", "x", "", "x"));
+        assert!(!validators_compatible("", "x", "", "y"));
     }
 }

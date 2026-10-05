@@ -17,7 +17,7 @@
 
 use crate::backend::{redact_sensitive, same_origin, Backend, Endpoint, RangeCheck};
 use crate::errors::{fatal, retryable, Result, ERR_RANGE_MISMATCH};
-use crate::util::{parse_content_range, parse_filename};
+use crate::util::parse_content_range;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
@@ -55,20 +55,15 @@ const FINAL_URL_TTL: Duration = Duration::from_secs(300);
 /// 探路结果：两个后端共用同一形状（定义在 `backend`）。
 pub use crate::backend::ProbeInfo;
 
-/// 一个下载目标：网址 +（可选）绑定到某个 IP。
-/// 多 IP / 镜像并行时，由上层为每个来源建一个 Target。
+/// 一个下载目标：就一个网址。
 #[derive(Clone, Debug)]
 pub struct Target {
     pub url: String,
-    pub ip: Option<IpAddr>,
 }
 
 impl Target {
     pub fn new(url: impl Into<String>) -> Self {
-        Target { url: url.into(), ip: None }
-    }
-    pub fn pinned(url: impl Into<String>, ip: IpAddr) -> Self {
-        Target { url: url.into(), ip: Some(ip) }
+        Target { url: url.into() }
     }
 }
 
@@ -127,10 +122,10 @@ impl NetClient {
 
     /// 探路。注意：会真的发一个 `Range: bytes=0-0` 的 GET。
     pub fn probe(&self, t: &Target, headers: &[(String, String)]) -> Result<ProbeInfo> {
-        let (mut status, mut hdrs, _body) = self.request(&t.url, t.ip, headers, Some((0, 0)))?;
+        let (mut status, mut hdrs, _body) = self.request(&t.url, headers, Some((0, 0)))?;
         if status == 416 {
             // 个别服务器对 "bytes=0-0" 回 416：退回不带 Range 再探一次
-            let (s2, h2, b2) = self.request(&t.url, t.ip, headers, None)?;
+            let (s2, h2, b2) = self.request(&t.url, headers, None)?;
             status = s2;
             hdrs = h2;
             drop(b2);
@@ -138,12 +133,11 @@ impl NetClient {
 
         let etag = header_get(&hdrs, "etag").to_string();
         let last_modified = header_get(&hdrs, "last-modified").to_string();
-        let file_name = parse_filename(header_get(&hdrs, "content-disposition"));
         let content_range = header_get(&hdrs, "content-range").to_string();
         let accept_ranges = header_get(&hdrs, "accept-ranges").to_string();
         let clen = header_get(&hdrs, "content-length").trim().parse::<i64>().unwrap_or(0);
 
-        let mut info = ProbeInfo { size: 0, range_ok: false, etag, last_modified, file_name };
+        let mut info = ProbeInfo { size: 0, range_ok: false, etag, last_modified };
         if status == 206 {
             if let Some((start, _end, total)) = parse_content_range(&content_range) {
                 // 只有总长已知（非 `*`）才敢定 size；`bytes 0-0/*` 时 size 未知，交给整文件模式
@@ -156,7 +150,7 @@ impl NetClient {
             info.range_ok = false;
             info.size = clen;
         } else {
-            self.clear_final(&cache_key(&t.url, t.ip));
+            self.clear_final(&cache_key(&t.url));
             return Err(fatal("probe", format!("服务器返回状态 {status}")));
         }
         if accept_ranges.eq_ignore_ascii_case("none") {
@@ -174,21 +168,21 @@ impl NetClient {
         to: i64,
         expect: &RangeCheck,
     ) -> Result<Body> {
-        let (status, hdrs, body) = self.request(&t.url, t.ip, headers, Some((from, to)))?;
+        let (status, hdrs, body) = self.request(&t.url, headers, Some((from, to)))?;
         if status != 206 {
-            self.clear_final(&cache_key(&t.url, t.ip));
+            self.clear_final(&cache_key(&t.url));
             return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: 期望 206，实际 {status}")));
         }
         let cr = header_get(&hdrs, "content-range");
         let (start, _end, total) = match parse_content_range(cr) {
             Some(x) => x,
             None => {
-                self.clear_final(&cache_key(&t.url, t.ip));
+                self.clear_final(&cache_key(&t.url));
                 return Err(retryable("range", format!("{ERR_RANGE_MISMATCH}: Content-Range 缺失")));
             }
         };
         if start != from {
-            self.clear_final(&cache_key(&t.url, t.ip));
+            self.clear_final(&cache_key(&t.url));
             return Err(retryable(
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 期望起点 {from}，服务器给了 {start}"),
@@ -196,7 +190,7 @@ impl NetClient {
         }
         // 复核总长/验证器：堵"诚实服务器中途换了内容或换了个来源"
         if expect.total > 0 && total > 0 && total != expect.total {
-            self.clear_final(&cache_key(&t.url, t.ip));
+            self.clear_final(&cache_key(&t.url));
             return Err(retryable(
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 总长变了（探路 {}，现在 {total}）", expect.total),
@@ -210,7 +204,7 @@ impl NetClient {
             && (!re.is_empty() || !rl.is_empty())
             && !crate::backend::validators_compatible(expect.etag, expect.last_modified, re, rl)
         {
-            self.clear_final(&cache_key(&t.url, t.ip));
+            self.clear_final(&cache_key(&t.url));
             return Err(retryable(
                 "range",
                 format!("{ERR_RANGE_MISMATCH}: 验证器变了（ETag '{re}' / Last-Modified '{rl}'）"),
@@ -221,10 +215,10 @@ impl NetClient {
 
     /// 整文件 GET（不带 Range），用于"服务器不支持分段"时的单线程兜底。
     pub fn open_plain(&self, t: &Target, headers: &[(String, String)]) -> Result<Body> {
-        let (status, _hdrs, body) = self.request(&t.url, t.ip, headers, None)?;
+        let (status, _hdrs, body) = self.request(&t.url, headers, None)?;
         // 204/205 是"无内容"，不能当成功空文件
         if !(200..300).contains(&status) || status == 204 || status == 205 {
-            self.clear_final(&cache_key(&t.url, t.ip));
+            self.clear_final(&cache_key(&t.url));
             return Err(retryable("whole", format!("服务器返回状态 {status}")));
         }
         Ok(body)
@@ -235,21 +229,19 @@ impl NetClient {
     fn request(
         &self,
         url: &str,
-        pin: Option<IpAddr>,
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<(u16, Vec<(String, String)>, Body)> {
-        let ck = cache_key(url, pin);
+        let ck = cache_key(url);
         if let Some(final_url) = self.cached_final(&ck) {
             if final_url != url {
                 self.stat_final_hits.fetch_add(1, Ordering::Relaxed);
                 let same = same_origin(url, &final_url);
-                let hop_pin = if same { pin } else { None };
                 // 跨域：别把 Authorization/Cookie 发到跳转后的主机
                 let hdrs: Vec<(String, String)> =
                     if same { headers.to_vec() } else { redact_sensitive(headers) };
                 if let Ok((status, hdrs_r, body, _)) =
-                    self.request_follow(&final_url, hop_pin, &hdrs, range)
+                    self.request_follow(&final_url, &hdrs, range)
                 {
                     if (200..400).contains(&status) {
                         return Ok((status, hdrs_r, body));
@@ -259,7 +251,7 @@ impl NetClient {
                 self.clear_final(&ck);
             }
         }
-        let (status, hdrs, body, final_url) = self.request_follow(url, pin, headers, range)?;
+        let (status, hdrs, body, final_url) = self.request_follow(url, headers, range)?;
         if final_url != url {
             let mut m = self.final_cache.lock().unwrap_or_else(|e| e.into_inner());
             if m.len() > MAX_FINAL_CACHE {
@@ -289,25 +281,23 @@ impl NetClient {
     fn request_follow(
         &self,
         url: &str,
-        pin: Option<IpAddr>,
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<(u16, Vec<(String, String)>, Body, String)> {
-        // 原始地址（用于判断"是否跨域"）：跨域就剥敏感头、也别再绑原主机的 IP
+        // 原始地址（用于判断"是否跨域"）：跨域就剥敏感头
         let base = parse_url(url)?;
         let redacted = redact_sensitive(headers);
         let mut current = url.to_string();
         for _ in 0..=MAX_REDIRECTS {
             let u = parse_url(&current)?;
             let same = u.https == base.https && u.host == base.host && u.port == base.port;
-            let hop_pin = if same { pin } else { None };
             let send_headers: &[(String, String)] = if same { headers } else { &redacted };
-            let key = conn_key(&u, hop_pin);
+            let key = conn_key(&u);
 
             // 复用连接可能已被对端关掉：失败一次就换新连接重试（最多两次）
             let mut got = None;
             for attempt in 0..2 {
-                let (mut reader, reused) = self.take_conn(&key, &u, hop_pin)?;
+                let (mut reader, reused) = self.take_conn(&key, &u)?;
                 match self.exchange(&mut reader, &u, send_headers, range) {
                     Ok((status, hdrs)) => {
                         got = Some((reader, status, hdrs));
@@ -376,7 +366,7 @@ impl NetClient {
     }
 
     /// 从池里取一条（仍新鲜）的连接；没有就新建。
-    fn take_conn(&self, key: &str, u: &ParsedUrl, pin: Option<IpAddr>) -> Result<(BufReader<Stream>, bool)> {
+    fn take_conn(&self, key: &str, u: &ParsedUrl) -> Result<(BufReader<Stream>, bool)> {
         {
             let mut m = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = m.get_mut(key) {
@@ -389,7 +379,7 @@ impl NetClient {
                 }
             }
         }
-        Ok((BufReader::new(self.connect(u, pin)?), false))
+        Ok((BufReader::new(self.connect(u)?), false))
     }
 
     /// 把一条（确认没有响应体的）连接放回池里复用。
@@ -424,13 +414,9 @@ impl NetClient {
         }
     }
 
-    fn connect(&self, u: &ParsedUrl, pin: Option<IpAddr>) -> Result<Stream> {
-        // 候选地址：优先"绑定的 IP"，然后补上同域名解析出的其它 IP。
-        // 这样某个 IP 偶发连不通时，能在本次请求内直接换一个，而不是干等超时。
+    fn connect(&self, u: &ParsedUrl) -> Result<Stream> {
+        // 候选地址：把域名解析出的所有 IP 都列出来，某个不通就并发换下一个（不是干等超时）。
         let mut cands: Vec<IpAddr> = Vec::new();
-        if let Some(ip) = pin {
-            cands.push(ip);
-        }
         if let Ok(res) = (u.host.as_str(), u.port).to_socket_addrs() {
             for a in res {
                 let ip = a.ip();
@@ -804,19 +790,18 @@ fn wants_keep_alive(headers: &[(String, String)]) -> bool {
     !header_get(headers, "connection").to_ascii_lowercase().contains("close")
 }
 
-fn conn_key(u: &ParsedUrl, pin: Option<IpAddr>) -> String {
+fn conn_key(u: &ParsedUrl) -> String {
     format!(
-        "{}://{}:{}|{}",
+        "{}://{}:{}",
         if u.https { "https" } else { "http" },
         u.host,
-        u.port,
-        pin.map(|i| i.to_string()).unwrap_or_default()
+        u.port
     )
 }
 
-/// 跳转缓存键：同一个 URL 绑不同 IP 要分开记（否则"多 IP 并行"会被一个跳转键覆盖掉）。
-fn cache_key(url: &str, ip: Option<IpAddr>) -> String {
-    format!("{url}|{}", ip.map(|i| i.to_string()).unwrap_or_default())
+/// 跳转缓存键。
+fn cache_key(url: &str) -> String {
+    url.to_string()
 }
 
 fn build_request(
@@ -1061,7 +1046,7 @@ fn remove_dot_segments(path: &str) -> String {
 // ---------------- 接入统一后端接口 ----------------
 
 fn to_target(ep: &Endpoint) -> Target {
-    Target { url: ep.url.clone(), ip: ep.ip }
+    Target { url: ep.url.clone() }
 }
 
 impl Backend for NetClient {

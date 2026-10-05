@@ -1,4 +1,4 @@
-use crate::backend::{build_pool, Backend, Endpoint, ProbeInfo};
+use crate::backend::{probe_target, Backend, Endpoint, ProbeInfo};
 use crate::config::Config;
 use crate::errors::{fatal, retryable, Error, ErrorKind, Result, ERR_TOO_MANY_FAILURES};
 use crate::limiter::Limiter;
@@ -6,7 +6,7 @@ use crate::part::{Part, SAFETY_STEP};
 use crate::split::split_to_range;
 use crate::store::{self, PartState, ResumeState, STATE_FILE_NAME};
 use crate::types::{Callbacks, DownloadResult, Progress, Request, Status};
-use crate::util::{filename_from_url, job_key, sanitize_name, Lock};
+use crate::util::{job_key, Lock};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -167,14 +167,12 @@ impl Engine {
             .filter(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"))
             .cloned()
             .collect();
-        let (eps, pi) = match build_pool(
+        let pi = match probe_target(
             self.backend.as_ref(),
             &self.cfg,
             &req.url,
-            &req.mirrors,
             &probe_headers,
             &|| shared.is_canceled(),
-            &|m| shared.logf("WARN", m),
         ) {
             Ok(x) => x,
             Err(e) => {
@@ -187,26 +185,21 @@ impl Engine {
                 return Err(e);
             }
         };
-        let n_src = eps.len().max(1);
-        let labels: Vec<String> = eps.iter().map(|e| e.label.clone()).collect();
-        let _ = shared.src_labels.set(labels);
-        let _ = shared.src_bytes.set((0..n_src).map(|_| AtomicI64::new(0)).collect());
-        let _ = shared.src_conns.set((0..n_src).map(|_| AtomicUsize::new(0)).collect());
-        let _ = shared.endpoints.set(eps);
+        let label = crate::backend::host_of(&req.url).unwrap_or_else(|| "default".to_string());
+        let _ = shared.src_labels.set(vec![label.clone()]);
+        let _ = shared.src_bytes.set(vec![AtomicI64::new(0)]);
+        let _ = shared.src_conns.set(vec![AtomicUsize::new(0)]);
+        let _ = shared.endpoints.set(vec![Endpoint { url: req.url.clone() }]);
         let _ = shared.backend.set(self.backend.clone());
         let _ = shared.headers.set(req.headers.clone());
-        let src_desc = if n_src > 1 { "主地址 + 镜像/多 IP" } else { "单一来源" };
-        shared.logf(
-            "INFO",
-            format!("下载来源：{n_src} 个（{src_desc}；网络后端={}）", self.backend.name()),
-        );
+        shared.logf("INFO", format!("下载来源：{label}（网络后端={}）", self.backend.name()));
         let size = pi.size.max(0);
         shared.total.store(size, Ordering::SeqCst);
         *shared.etag.lock() = pi.etag.clone();
         *shared.last_mod.lock() = pi.last_modified.clone();
 
         // 确定最终路径
-        let (final_path, temp_dir) = match self.setup_paths(&req, &pi) {
+        let (final_path, temp_dir) = match self.setup_paths(&req) {
             Ok(x) => x,
             Err(e) => {
                 shared.status(Status::Failed);
@@ -328,13 +321,8 @@ impl Engine {
         let mut last_state_save = Instant::now();
         let mut rate_t = Instant::now();
         let mut rate_bytes = 0i64;
-        // 自适应并发：从 initial 起步，每 2 秒按实测速度微调；关闭则固定用 max
-        let mut target = if self.cfg.adaptive_threads {
-            self.cfg.initial_threads.max(1)
-        } else {
-            self.cfg.max_threads
-        };
-        let mut last_ctrl = Instant::now();
+        // 固定并发：工人数 = max_threads
+        let target = self.cfg.max_threads;
         // 诊断统计
         let mut last_stat = Instant::now();
         let mut prev_total = 0i64;
@@ -360,15 +348,6 @@ impl Engine {
                     shared.active.store(shared.running.load(Ordering::SeqCst), Ordering::SeqCst);
                     rate_t = now;
                     rate_bytes = bytes;
-                }
-                // 自适应（可选）：只增不减地"爬坡"到目标，不做速度反馈 → 不会抖动
-                if self.cfg.adaptive_threads && now.duration_since(last_ctrl) >= Duration::from_secs(2) {
-                    if target < self.cfg.max_threads {
-                        let step = (target / 4).max(1);
-                        target = (target + step).min(self.cfg.max_threads);
-                        shared.logf("DEBUG", format!("自适应并发：爬坡 → 目标 {target} 路"));
-                    }
-                    last_ctrl = now;
                 }
             }
             // 每 2 秒打一条"统计"：活跃数、整体速度、各来源用量（诊断腰斩/波动用）
@@ -502,24 +481,11 @@ impl Engine {
         })
     }
 
-    fn setup_paths(&self, req: &Request, pi: &ProbeInfo) -> Result<(PathBuf, PathBuf)> {
+    fn setup_paths(&self, req: &Request) -> Result<(PathBuf, PathBuf)> {
+        // 核心不替宿主猜文件名：必须给明确的落盘路径。
         let final_path = match &req.target_file {
             Some(f) if !f.is_empty() => PathBuf::from(f),
-            _ => {
-                let mut name = pi.file_name.clone();
-                if name.is_empty() {
-                    name = filename_from_url(&req.url);
-                }
-                if name.is_empty() {
-                    name = "download.bin".to_string();
-                }
-                let dir = req
-                    .target_dir
-                    .clone()
-                    .filter(|d| !d.is_empty())
-                    .unwrap_or_else(|| ".".to_string());
-                PathBuf::from(dir).join(sanitize_name(&name))
-            }
+            _ => return Err(fatal("request", "必须指定 target_file（核心不自动取文件名）")),
         };
         let key = target_key(&final_path);
         let temp_dir = self.cfg.temp_dir.join(key);
@@ -688,7 +654,7 @@ impl Engine {
     }
 
     fn download_whole_once(&self, shared: &Arc<Shared>, limiter: &Arc<Limiter>, marker: &Path) -> Result<()> {
-        let (be, ep, src_idx) = shared.pick_source();
+        let (be, ep) = shared.source();
         let headers = shared.headers_for(&ep.url);
         let mut body = be.open_plain(&ep, &headers)?;
         let mut file = File::create(marker).map_err(|e| fatal("create", format!("创建文件失败: {e}")))?;
@@ -710,7 +676,6 @@ impl Engine {
                 Ok(n) => {
                     file.write_all(&buf[..n]).map_err(|e| fatal("write", format!("{e}")))?;
                     shared.add_downloaded(n as i64);
-                    shared.add_src_bytes(src_idx, n as i64);
                     // 单线程模式也要限速（以前漏了）
                     if limiter.wait(n as i64, &|| shared.is_canceled()).is_err() {
                         return Err(Error::canceled());
@@ -749,7 +714,6 @@ struct Shared {
     backend: std::sync::OnceLock<Arc<dyn Backend>>,
     endpoints: std::sync::OnceLock<Vec<Endpoint>>,
     headers: std::sync::OnceLock<Vec<(String, String)>>,
-    src_next: AtomicUsize,
     // 诊断用：每个来源的标签、累计字节、连接次数
     src_labels: std::sync::OnceLock<Vec<String>>,
     src_bytes: std::sync::OnceLock<Vec<AtomicI64>>,
@@ -789,7 +753,6 @@ impl Shared {
             backend: std::sync::OnceLock::new(),
             endpoints: std::sync::OnceLock::new(),
             headers: std::sync::OnceLock::new(),
-            src_next: AtomicUsize::new(0),
             src_labels: std::sync::OnceLock::new(),
             src_bytes: std::sync::OnceLock::new(),
             src_conns: std::sync::OnceLock::new(),
@@ -823,27 +786,16 @@ impl Shared {
             .unwrap_or(false)
     }
 
-    /// 轮换取一个下载来源（多 IP / 镜像之间轮转），返回其下标供统计
-    fn pick_source(&self) -> (Arc<dyn Backend>, Endpoint, usize) {
+    /// 取下载目标（核心只有一个来源）与网络后端；顺带记一次连接数。
+    fn source(&self) -> (Arc<dyn Backend>, Endpoint) {
         let be = self.backend.get().expect("backend 未初始化").clone();
-        let eps = self.endpoints.get().expect("endpoints 未初始化");
-        let n = eps.len().max(1);
-        let idx = self.src_next.fetch_add(1, Ordering::SeqCst) % n;
-        let ep = eps[idx].clone();
+        let ep = self.endpoints.get().expect("endpoints 未初始化")[0].clone();
         if let Some(v) = self.src_conns.get() {
-            if let Some(c) = v.get(idx) {
+            if let Some(c) = v.first() {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }
-        (be, ep, idx)
-    }
-
-    fn add_src_bytes(&self, idx: usize, n: i64) {
-        if let Some(v) = self.src_bytes.get() {
-            if let Some(c) = v.get(idx) {
-                c.fetch_add(n, Ordering::SeqCst);
-            }
-        }
+        (be, ep)
     }
 
     fn headers(&self) -> Vec<(String, String)> {
@@ -1181,16 +1133,17 @@ fn download_part_once(
         if current > to {
             return Ok(());
         }
-        // 每次（重）连接都轮换一个来源：多 IP / 镜像之间轮转
-        let (be, ep, src_idx) = shared.pick_source();
+        let (be, ep) = shared.source();
         let mut headers = shared.headers_for(&ep.url);
-        // 用"这个来源自己"的验证器发 If-Range
-        if let Some(v) = crate::backend::if_range_value(&ep.etag, &ep.last_modified) {
+        // 带身份证：内容若在下载期间变了，服务器会按 If-Range 改回 200，我们据此报错而不是拼错
+        if let Some(v) = shared.if_range_value() {
             headers.push(("If-Range".to_string(), v));
         }
+        let etag = shared.etag.lock().clone();
+        let last_mod = shared.last_mod.lock().clone();
         let expect = crate::backend::RangeCheck {
-            etag: &ep.etag,
-            last_modified: &ep.last_modified,
+            etag: &etag,
+            last_modified: &last_mod,
             total: shared.total.load(Ordering::SeqCst),
         };
         let body = match be.open_range(&ep, &headers, current, to, &expect) {
@@ -1198,16 +1151,13 @@ fn download_part_once(
             Err(e) => {
                 shared.logf(
                     "WARN",
-                    format!(
-                        "打开分段连接失败（来源 {}）：段 [{from}, {to}]，从 {current} 开始，错误={e}",
-                        ep.label
-                    ),
+                    format!("打开分段连接失败：段 [{from}, {to}]，从 {current} 开始，错误={e}"),
                 );
                 return Err(e);
             }
         };
         let watch = reconnects < MAX_SLOW_RECONNECTS;
-        match pump(shared, limiter, cfg, part, &mut file, body, watch, src_idx) {
+        match pump(shared, limiter, cfg, part, &mut file, body, watch) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind == ErrorKind::Slow => {
                 reconnects += 1;
@@ -1227,7 +1177,6 @@ fn pump(
     file: &mut File,
     mut body: Box<dyn Read + Send>,
     watch_slow: bool,
-    src_idx: usize,
 ) -> Result<()> {
     let mut pending: Vec<u8> = Vec::new();
     let mut pending_off = 0usize;
@@ -1301,7 +1250,6 @@ fn pump(
         pending_off += n;
         part.lock().advance(n as i64);
         shared.add_downloaded(n as i64);
-        shared.add_src_bytes(src_idx, n as i64);
         window_bytes += n as i64;
         if limiter
             .wait(n as i64, &|| shared.is_canceled())

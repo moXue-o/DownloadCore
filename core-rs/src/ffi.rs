@@ -120,8 +120,6 @@ pub struct dc_config {
     pub incomplete_suffix: *const c_char,
     pub user_agent: *const c_char,
     pub max_speed: u64,
-    pub adaptive_threads: c_int,
-    pub use_multiple_ips: c_int,
 }
 
 #[repr(C)]
@@ -129,12 +127,9 @@ pub struct dc_config {
 pub struct dc_request {
     pub url: *const c_char,
     pub target_file: *const c_char,
-    pub target_dir: *const c_char,
     pub header_keys: *const *const c_char,
     pub header_values: *const *const c_char,
     pub header_count: usize,
-    pub mirror_urls: *const *const c_char,
-    pub mirror_count: usize,
     /// 期望的 SHA-256（可选，NULL=不校验）；给了就必须匹配，否则判失败
     pub expected_sha256: *const c_char,
 }
@@ -259,8 +254,6 @@ pub extern "C" fn dc_config_default() -> dc_config {
         incomplete_suffix: std::ptr::null(),
         user_agent: std::ptr::null(),
         max_speed: d.max_speed,
-        adaptive_threads: if d.adaptive_threads { 1 } else { 0 },
-        use_multiple_ips: if d.use_multiple_ips { 1 } else { 0 },
     }
 }
 
@@ -305,8 +298,6 @@ pub unsafe extern "C" fn dc_engine_new(cfg: *const dc_config) -> *mut dc_engine 
                 c.user_agent = s;
             }
             c.max_speed = cc.max_speed;
-            c.adaptive_threads = cc.adaptive_threads != 0;
-            c.use_multiple_ips = cc.use_multiple_ips != 0;
         }
         Box::into_raw(Box::new(dc_engine {
             engine: Engine::new(c),
@@ -429,24 +420,12 @@ pub unsafe extern "C" fn dc_engine_download(
                 }
             }
 
-            let mut mirrors = Vec::new();
-            if r.mirror_count > 0 && !r.mirror_urls.is_null() {
-                for i in 0..r.mirror_count {
-                    let m = unsafe { *r.mirror_urls.add(i) };
-                    if let Some(m) = cstr_to_string(m) {
-                        mirrors.push(m);
-                    }
-                }
-            }
-
             let request = Request {
                 url,
                 target_file: cstr_to_string(r.target_file),
-                target_dir: cstr_to_string(r.target_dir),
                 headers,
                 cancel: Some(e.cancel.clone()),
                 pause: Some(e.pause.clone()),
-                mirrors,
                 expected_sha256: cstr_to_string(r.expected_sha256),
             };
 
@@ -533,19 +512,16 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_result, range_ok), 32);
 
         assert_eq!(align_of::<dc_request>(), 8);
-        assert_eq!(size_of::<dc_request>(), 72);
+        assert_eq!(size_of::<dc_request>(), 48);
         assert_eq!(offset_of!(dc_request, url), 0);
         assert_eq!(offset_of!(dc_request, target_file), 8);
-        assert_eq!(offset_of!(dc_request, target_dir), 16);
-        assert_eq!(offset_of!(dc_request, header_keys), 24);
-        assert_eq!(offset_of!(dc_request, header_values), 32);
-        assert_eq!(offset_of!(dc_request, header_count), 40);
-        assert_eq!(offset_of!(dc_request, mirror_urls), 48);
-        assert_eq!(offset_of!(dc_request, mirror_count), 56);
-        assert_eq!(offset_of!(dc_request, expected_sha256), 64);
+        assert_eq!(offset_of!(dc_request, header_keys), 16);
+        assert_eq!(offset_of!(dc_request, header_values), 24);
+        assert_eq!(offset_of!(dc_request, header_count), 32);
+        assert_eq!(offset_of!(dc_request, expected_sha256), 40);
 
         assert_eq!(align_of::<dc_config>(), 8);
-        assert_eq!(size_of::<dc_config>(), 72);
+        assert_eq!(size_of::<dc_config>(), 64);
         assert_eq!(offset_of!(dc_config, initial_threads), 0);
         assert_eq!(offset_of!(dc_config, max_threads), 4);
         assert_eq!(offset_of!(dc_config, min_part_size), 8);
@@ -557,8 +533,6 @@ mod layout_tests {
         assert_eq!(offset_of!(dc_config, incomplete_suffix), 40);
         assert_eq!(offset_of!(dc_config, user_agent), 48);
         assert_eq!(offset_of!(dc_config, max_speed), 56);
-        assert_eq!(offset_of!(dc_config, adaptive_threads), 64);
-        assert_eq!(offset_of!(dc_config, use_multiple_ips), 68);
     }
 
     #[test]
@@ -653,10 +627,11 @@ mod layout_tests {
         let dir = std::env::temp_dir().join(format!("dcdemo-ffi-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let c_url = std::ffi::CString::new(url).unwrap();
-        let c_dir = std::ffi::CString::new(dir.display().to_string()).unwrap();
+        let target = dir.join("f.bin");
+        let c_target = std::ffi::CString::new(target.display().to_string()).unwrap();
         let mut req: dc_request = unsafe { std::mem::zeroed() };
         req.url = c_url.as_ptr();
-        req.target_dir = c_dir.as_ptr();
+        req.target_file = c_target.as_ptr();
 
         let e = unsafe { dc_engine_new(std::ptr::null()) };
         assert!(!e.is_null());

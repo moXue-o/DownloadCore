@@ -45,18 +45,14 @@ pub struct LogEntry {
 #[derive(Debug, Clone, Default)]
 pub struct Request {
     pub url: String,
-    /// 保存到哪个文件；留空则自动取名（见 target_dir）
+    /// 保存到哪个文件（完整路径）。**必填**：核心不替你猜文件名。
     pub target_file: Option<String>,
-    /// 自动取名时存到哪个目录；留空表示当前目录
-    pub target_dir: Option<String>,
     /// 额外的请求头
     pub headers: Vec<(String, String)>,
     /// 外部取消标志：置为 true 即中止下载（已下进度保留，供续传）
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 外部暂停标志：置为 true 即暂停（连接保持，恢复后继续），可从别的线程调用
     pub pause: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// 镜像地址（同一文件的其它来源）；可与主地址并行，用来突破单源限速
-    pub mirrors: Vec<String>,
     /// 期望的 SHA-256（十六进制）；给了它，文件下完后必须匹配，否则判失败（防静默损坏）
     pub expected_sha256: Option<String>,
 }

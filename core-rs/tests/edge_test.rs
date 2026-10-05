@@ -21,7 +21,6 @@ fn test_config(dir: &PathBuf) -> Config {
     c.idle_timeout = Duration::from_secs(3);
     c.max_retries = 2;
     c.retry_delay = Duration::from_millis(50);
-    c.adaptive_threads = false;
     c
 }
 

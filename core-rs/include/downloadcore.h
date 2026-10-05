@@ -87,19 +87,14 @@ typedef struct dc_config {
     const char* incomplete_suffix; /* 未完成后缀；NULL/空 用默认 */
     const char* user_agent;     /* NULL/空 用默认 */
     uint64_t max_speed;         /* 全局限速（字节/秒），0 不限 */
-    int      adaptive_threads;  /* 1=并发在 initial..max 之间自动爬坡（默认 0=固定并发） */
-    int      use_multiple_ips;  /* 1=域名解析成多个 IP 并行；0=关闭（dc_config_default 给 1） */
 } dc_config;
 
 typedef struct dc_request {
     const char* url;            /* 必填 */
-    const char* target_file;    /* 指定保存路径（完整路径）；给了它就直接用它，target_dir 被忽略 */
-    const char* target_dir;     /* 仅在 target_file 为空、自动取名时生效的目录；NULL 表示当前目录 */
+    const char* target_file;    /* 必填：保存到哪个文件（完整路径） */
     const char* const* header_keys;   /* 额外请求头（可 NULL） */
     const char* const* header_values;
     size_t header_count;
-    const char* const* mirror_urls;   /* 镜像地址（同一文件），可 NULL */
-    size_t mirror_count;
     const char* expected_sha256;      /* 期望的 SHA-256（十六进制，可 NULL=不校验；给了就必须匹配） */
 } dc_request;
 

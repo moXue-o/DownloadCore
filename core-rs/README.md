@@ -55,7 +55,7 @@ cargo run --bin get -- -v         # 只看版本
 | 文件 | 作用 |
 | --- | --- |
 | `src/engine.rs` | 引擎与调度（一个工人一条线程，阻塞式） |
-| `src/backend.rs` | 网络后端抽象（`probe` / `open_range` / `open_plain`）+ 来源池（镜像 / 多 IP） |
+| `src/backend.rs` | 网络后端抽象（`probe` / `open_range` / `open_plain`）+ 探路重试 |
 | `src/netclient.rs` | 自研网络层（正式版后端）：标准库 + 系统 TLS，含分块 / 跳转 / 读超时 |
 | `src/client.rs` | LTS 后端：用 reqwest 实现同一接口（`--features backend-lts`） |
 | `src/part.rs` | 分段 + 安全区（"边下边分"的核心） |
@@ -63,7 +63,7 @@ cargo run --bin get -- -v         # 只看版本
 | `src/store.rs` | 续传记录（原子写入） |
 | `src/limiter.rs` | 全局令牌桶限速 |
 | `src/errors.rs` | 错误分类：可重试 / 致命 / 取消 / 过慢 |
-| `src/util.rs` | 文件名解析、路径、哈希、定位写入等 |
+| `src/util.rs` | 定位写入、SHA-256、路径等工具 |
 | `tests/common/mod.rs` | 可摆布的测试服务器（分段/不分段/分块/跳转/卡住/限速） |
 | `tests/engine_test.rs` | 引擎端到端测试 |
 | `tests/netclient_test.rs` | 自研网络层独立测试 |
@@ -78,14 +78,11 @@ cargo run --bin get -- -v         # 只看版本
 - 慢连接看门狗（过慢则重开连接）
 - 错误分类、单输出文件按偏移直写（无拼装）、下完才改名
 - 续传（原子写入 + 取消后续传 + 换文件重下）
-- 全局限速、探测分段支持、文件名解析
-- **镜像 / 多来源**：同一文件多个地址并行，突破单源限速（大小/ETag 一致才采纳镜像）
-- **多 IP 并行**：域名解析成多个 IP，每个 IP 一个来源轮转，可绕过"单 IP 限速"
-- **自适应并发**（可选，默认关）：只增不减地"爬坡"到 max（不做速度反馈，不会抖动）；关则固定用 max。像 AB 那样固定并发也完全可用
+- 全局限速、探测分段支持
 - 暂停 / 恢复 / 取消（可从别的线程调用）
 - **可选端到端校验和**：`Request.expected_sha256`（C 侧 `dc_request.expected_sha256`）给了就在改名前端到端核对，不符判失败——这是"防静默损坏"的根治手段
 
-测试：**26 个单元测试**（LTS 下 27）+ **9 个引擎端到端** + **16 个网络层** + **25 个边角**（`edge_test.rs`），全部通过；两种后端各跑一遍。
+测试：**25 个单元测试**（LTS 下 26）+ **7 个引擎端到端** + **16 个网络层** + **25 个边角**（`edge_test.rs`），全部通过；两种后端各跑一遍。
 
 ## 设计要点
 
@@ -108,7 +105,7 @@ dc_config cfg = dc_config_default();      /* 按需改字段 */
 dc_engine* e = dc_engine_new(&cfg);
 dc_request req; memset(&req, 0, sizeof(req));
 req.url = "https://...";
-req.target_dir = ".";                      /* 不给文件名就自动取名 */
+req.target_file = "/data/out/thing.bin";   /* 必填：完整落盘路径（核心不替宿主取名） */
 
 dc_result res; memset(&res, 0, sizeof(res));
 char* err = NULL;
@@ -143,5 +140,4 @@ cd cdemo && .\build.bat          # 用 MSVC 编译并链接 downloadcore.lib
 
 ## 下一步
 
-- 把两种后端的"来源池 / 参数"进一步收口为一份配置。
 - 跨平台（Linux/macOS）验证。
