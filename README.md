@@ -14,6 +14,7 @@ Rust 下载核心 · 多线程分段 · <code>staticlib</code> + C ABI · 在宿
   <img alt="abi"     src="https://img.shields.io/badge/ABI-C%20staticlib-555555">
   <img alt="http"    src="https://img.shields.io/badge/HTTP-1.1-4285F4">
   <img alt="version" src="https://img.shields.io/badge/version-0.1.0-success">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="deps"    src="https://img.shields.io/badge/dependencies-0%20CVE-success">
 </p>
 
@@ -38,6 +39,7 @@ Rust 下载核心 · 多线程分段 · <code>staticlib</code> + C ABI · 在宿
 - [设计要点](#设计要点)
 - [范围边界](#范围边界)
 - [已知边界](#已知边界)
+- [许可证](#许可证)
 
 ## 特性
 
@@ -234,3 +236,10 @@ Rust 侧 `Config` 与 C 侧 `dc_config` 一一对应（C 用毫秒）。`<=0` �
 - 目前只在 **Windows** 实测；Linux / macOS 未验证，Linux 需系统 OpenSSL。
 - 校验和是**可选**的：宿主不给 `expected_sha256`、且服务器无验证器 / 谎报时，静默损坏无法根治。
 - 分段阈值（看门狗窗口、尾巴细切粒度等）为经验值，换一批服务器可能需要调整。
+
+## 许可证
+
+采用 **MIT OR Apache-2.0** 双许可，使用者可任选其一：
+
+- [`LICENSE-MIT`](LICENSE-MIT)
+- [`LICENSE-APACHE`](LICENSE-APACHE)

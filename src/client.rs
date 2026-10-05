@@ -77,7 +77,7 @@ impl LtsBackend {
             return Ok(c.clone());
         }
 
-        let mut b = reqwest::Client::builder()
+        let b = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(self.idle_timeout)
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
