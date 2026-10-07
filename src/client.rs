@@ -37,6 +37,8 @@ pub struct LtsBackend {
     user_agent: String,
     idle_timeout: Duration,
     max_threads: usize,
+    /// 代理串（http:// / socks5://）；None = 明确不走代理
+    proxy: Option<String>,
     /// 按 "host|ip" 缓存客户端：连同一个来源的请求复用同一个连接池。
     clients: Mutex<HashMap<String, reqwest::Client>>,
     /// 跳转缓存：原始地址 -> 跳转后的真实地址（省掉每分段的一跳）。
@@ -58,6 +60,7 @@ impl LtsBackend {
             user_agent: cfg.user_agent.clone(),
             idle_timeout: cfg.idle_timeout,
             max_threads: cfg.max_threads.max(1),
+            proxy: cfg.proxy.clone(),
             clients: Mutex::new(HashMap::new()),
             final_cache: Mutex::new(HashMap::new()),
             stat_final_hits: AtomicUsize::new(0),
@@ -94,9 +97,14 @@ impl LtsBackend {
             }))
             .pool_max_idle_per_host(self.max_threads)
             .pool_idle_timeout(Duration::from_secs(POOL_IDLE_SECS))
-            .http1_only()
-            // 不使用系统代理：代理属于宿主/系统的设置，应由宿主显式决定
-            .no_proxy();
+            .http1_only();
+        // 代理：宿主显式配置才用；否则明确不用系统代理
+        let b = match self.proxy.as_deref() {
+            Some(p) => b.proxy(
+                reqwest::Proxy::all(p).map_err(|e| fatal("proxy", format!("代理无效: {e}")))?,
+            ),
+            None => b.no_proxy(),
+        };
         let client =
             b.build().map_err(|e| fatal("http", format!("创建 HTTP 客户端失败: {e}")))?;
         let mut m = self.clients.lock().unwrap_or_else(|e| e.into_inner());

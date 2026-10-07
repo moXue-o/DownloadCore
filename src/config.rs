@@ -32,6 +32,9 @@ pub struct Config {
     pub user_agent: String,
     /// 全局限速（字节/秒），0 表示不限
     pub max_speed: u64,
+    /// 代理：`http://[user:pass@]host:port` 或 `socks5://[user:pass@]host:port`；
+    /// None 或空串 = 直连。http:// 既支持 HTTPS 目标（CONNECT 隧道）也支持 HTTP 目标。
+    pub proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -49,6 +52,7 @@ impl Default for Config {
             incomplete_suffix: ".part".to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_speed: 0,
+            proxy: None,
         }
     }
 }
@@ -95,6 +99,11 @@ impl Config {
         }
         if self.user_agent.is_empty() {
             self.user_agent = DEFAULT_USER_AGENT.to_string();
+        }
+        if let Some(p) = self.proxy.as_ref() {
+            if p.trim().is_empty() {
+                self.proxy = None;
+            }
         }
         self
     }

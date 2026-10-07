@@ -118,7 +118,11 @@ fn make_backend(cfg: &Config) -> Arc<dyn Backend> {
 
 #[cfg(not(feature = "backend-lts"))]
 fn make_backend(cfg: &Config) -> Arc<dyn Backend> {
-    Arc::new(crate::netclient::NetClient::new(cfg.user_agent.clone(), cfg.idle_timeout))
+    Arc::new(crate::netclient::NetClient::with_proxy(
+        cfg.user_agent.clone(),
+        cfg.idle_timeout,
+        cfg.proxy.as_deref(),
+    ))
 }
 
 impl Engine {

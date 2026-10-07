@@ -79,6 +79,8 @@ type Pool = Arc<Mutex<HashMap<String, Vec<Pooled>>>>;
 pub struct NetClient {
     user_agent: String,
     idle_timeout: Duration,
+    /// 代理配置（None = 直连）。
+    proxy: Option<ProxyConfig>,
     /// "冷宫"：连接失败过的 IP 及其失败时刻，短时间内不再优先尝试。
     bad: Mutex<HashMap<IpAddr, Instant>>,
     /// keep-alive 连接池：按 "host:port|ip" 复用连接。
@@ -98,15 +100,31 @@ pub struct NetClient {
 
 impl NetClient {
     pub fn new(user_agent: impl Into<String>, idle_timeout: Duration) -> Self {
+        Self::with_proxy(user_agent, idle_timeout, None)
+    }
+
+    /// 带代理构造。`proxy` 形如 `http://[user:pass@]host:port` 或 `socks5://...`；空/非法则直连。
+    pub fn with_proxy(user_agent: impl Into<String>, idle_timeout: Duration, proxy: Option<&str>) -> Self {
         // 读超时为 0 会让 set_read_timeout 静默失败 → 卡死；这里兜底成默认 15s
         let idle_timeout = if idle_timeout.is_zero() {
             Duration::from_secs(15)
         } else {
             idle_timeout
         };
+        let proxy = match proxy.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => match ProxyConfig::parse(s) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[downloadcore] 代理配置无效，改为直连：{e}");
+                    None
+                }
+            },
+            None => None,
+        };
         NetClient {
             user_agent: user_agent.into(),
             idle_timeout,
+            proxy,
             bad: Mutex::new(HashMap::new()),
             pool: Arc::new(Mutex::new(HashMap::new())),
             final_cache: Mutex::new(HashMap::new()),
@@ -343,7 +361,7 @@ impl NetClient {
         headers: &[(String, String)],
         range: Option<(i64, i64)>,
     ) -> Result<(u16, Vec<(String, String)>)> {
-        let req = build_request(u, &self.user_agent, headers, range);
+        let req = build_request(u, &self.user_agent, headers, range, self.use_absolute_form(u));
         reader
             .get_mut()
             .write_all(req.as_bytes())
@@ -414,10 +432,85 @@ impl NetClient {
         }
     }
 
+    /// 明文 HTTP 走 HTTP 代理时，请求行必须用绝对地址。
+    fn use_absolute_form(&self, u: &ParsedUrl) -> bool {
+        match &self.proxy {
+            Some(p) => p.kind == ProxyKind::Http && !u.https,
+            None => false,
+        }
+    }
+
     fn connect(&self, u: &ParsedUrl) -> Result<Stream> {
+        match self.proxy.clone() {
+            Some(p) => self.connect_via_proxy(u, &p),
+            None => self.connect_direct(u),
+        }
+    }
+
+    fn connect_direct(&self, u: &ParsedUrl) -> Result<Stream> {
+        let tcp = self.tcp_connect(&u.host, u.port)?;
+        self.setup_sock(&tcp);
+        if u.https {
+            self.wrap_tls(&u.host, tcp)
+        } else {
+            Ok(Stream::Plain(tcp))
+        }
+    }
+
+    fn connect_via_proxy(&self, u: &ParsedUrl, p: &ProxyConfig) -> Result<Stream> {
+        let tcp = self.tcp_connect(&p.host, p.port)?;
+        self.setup_sock(&tcp);
+        match p.kind {
+            ProxyKind::Socks5 => {
+                let mut s = tcp;
+                socks5_connect(&mut s, p, &u.host, u.port)?;
+                if u.https {
+                    self.wrap_tls(&u.host, s)
+                } else {
+                    Ok(Stream::Plain(s))
+                }
+            }
+            ProxyKind::Http => {
+                if u.https {
+                    let mut s = tcp;
+                    http_proxy_connect(&mut s, p, &u.host, u.port)?;
+                    self.wrap_tls(&u.host, s)
+                } else {
+                    // 明文 HTTP 目标：不建隧道，直接向代理发绝对地址请求
+                    Ok(Stream::Plain(tcp))
+                }
+            }
+        }
+    }
+
+    fn setup_sock(&self, tcp: &TcpStream) {
+        let _ = tcp.set_nodelay(true);
+        let _ = tcp.set_read_timeout(Some(self.idle_timeout));
+        let _ = tcp.set_write_timeout(Some(WRITE_TIMEOUT));
+    }
+
+    fn wrap_tls(&self, host: &str, tcp: TcpStream) -> Result<Stream> {
+        let connector = match self.tls.get() {
+            Some(c) => c,
+            None => {
+                let c = native_tls::TlsConnector::new()
+                    .map_err(|e| fatal("tls", format!("初始化系统 TLS 失败: {e}")))?;
+                let _ = self.tls.set(c);
+                self.tls.get().expect("刚设置")
+            }
+        };
+        let tls = connector
+            .connect(host, tcp)
+            .map_err(|e| retryable("tls", format!("TLS 握手失败: {e}")))?;
+        self.stat_tls.fetch_add(1, Ordering::Relaxed);
+        Ok(Stream::Tls(Box::new(tls)))
+    }
+
+    /// 建立到 `host:port` 的 TCP 连接（多地址 happy eyeballs + 坏地址冷宫）。
+    fn tcp_connect(&self, host: &str, port: u16) -> Result<TcpStream> {
         // 候选地址：把域名解析出的所有 IP 都列出来，某个不通就并发换下一个（不是干等超时）。
         let mut cands: Vec<IpAddr> = Vec::new();
-        if let Ok(res) = (u.host.as_str(), u.port).to_socket_addrs() {
+        if let Ok(res) = (host, port).to_socket_addrs() {
             for a in res {
                 let ip = a.ip();
                 if !cands.contains(&ip) {
@@ -426,7 +519,7 @@ impl NetClient {
             }
         }
         if cands.is_empty() {
-            return Err(fatal("connect", format!("找不到主机 {}", u.host)));
+            return Err(fatal("connect", format!("找不到主机 {host}")));
         }
         cands.truncate(MAX_CONNECT_ADDRS); // 别为了一个连接起一堆线程
 
@@ -448,7 +541,6 @@ impl NetClient {
         // 起跑式并发连接（happy eyeballs）：逐个地址晚一点起跑，谁先连上就用谁。
         // 避免"第一个地址不通 → 干等 6 秒再试下一个"。
         let (tx, rx) = std::sync::mpsc::channel::<(IpAddr, std::io::Result<TcpStream>)>();
-        let port = u.port;
         for (i, ip) in ordered.iter().enumerate() {
             let tx = tx.clone();
             let ip = *ip;
@@ -478,29 +570,8 @@ impl NetClient {
                 Err(_) => break,
             }
         }
-        let tcp = tcp.ok_or_else(|| retryable("connect", format!("连接 {} 失败: {last}", u.host)))?;
-        let _ = tcp.set_nodelay(true);
-        let _ = tcp.set_read_timeout(Some(self.idle_timeout));
-        let _ = tcp.set_write_timeout(Some(WRITE_TIMEOUT));
-
-        if u.https {
-            let connector = match self.tls.get() {
-                Some(c) => c,
-                None => {
-                    let c = native_tls::TlsConnector::new()
-                        .map_err(|e| fatal("tls", format!("初始化系统 TLS 失败: {e}")))?;
-                    let _ = self.tls.set(c);
-                    self.tls.get().expect("刚设置")
-                }
-            };
-            let tls = connector
-                .connect(&u.host, tcp)
-                .map_err(|e| retryable("tls", format!("TLS 握手失败: {e}")))?;
-            self.stat_tls.fetch_add(1, Ordering::Relaxed);
-            Ok(Stream::Tls(Box::new(tls)))
-        } else {
-            Ok(Stream::Plain(tcp))
-        }
+        let tcp = tcp.ok_or_else(|| retryable("connect", format!("连接 {host} 失败: {last}")))?;
+        Ok(tcp)
     }
 }
 
@@ -809,6 +880,7 @@ fn build_request(
     user_agent: &str,
     headers: &[(String, String)],
     range: Option<(i64, i64)>,
+    absolute: bool,
 ) -> String {
     let default_port = if u.https { 443 } else { 80 };
     // IPv6 字面量要加方括号，否则 Host 头非法
@@ -820,7 +892,13 @@ fn build_request(
     };
 
     let mut s = String::with_capacity(256);
-    s.push_str(&format!("GET {} HTTP/1.1\r\n", u.path_query));
+    // HTTP 代理 + 明文 HTTP 目标：请求行要用绝对地址（`GET http://host/path`）
+    let target = if absolute {
+        format!("{}{}", u.origin, u.path_query)
+    } else {
+        u.path_query.clone()
+    };
+    s.push_str(&format!("GET {target} HTTP/1.1\r\n"));
     s.push_str(&format!("Host: {host_header}\r\n"));
     // User-Agent 也要防注入（去掉 CR/LF）
     let ua: String = user_agent.chars().filter(|c| *c != '\r' && *c != '\n').collect();
@@ -1086,6 +1164,213 @@ impl Backend for NetClient {
     }
 }
 
+// ---------------- 代理 ----------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyKind {
+    Http,
+    Socks5,
+}
+
+/// 代理配置。`http://` 支持 HTTP/HTTPS 目标（HTTPS 走 CONNECT 隧道）；
+/// `socks5://` 支持两者。为避免日志泄露，Debug 不打印密码。
+#[derive(Clone)]
+pub struct ProxyConfig {
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: u16,
+    pub user: Option<String>,
+    pub pass: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pass", &self.pass.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl ProxyConfig {
+    /// 解析：`http://[user:pass@]host:port`、`socks5://...`，或裸 `host:port`（按 http 处理）。
+    pub fn parse(raw: &str) -> Result<ProxyConfig> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return Err(fatal("proxy", "代理为空"));
+        }
+        let (kind, rest) =
+            if let Some(r) = s.strip_prefix("socks5://").or_else(|| s.strip_prefix("socks5h://")) {
+                (ProxyKind::Socks5, r)
+            } else if let Some(r) = s.strip_prefix("socks://") {
+                (ProxyKind::Socks5, r)
+            } else if let Some(r) = s.strip_prefix("http://").or_else(|| s.strip_prefix("https://")) {
+                (ProxyKind::Http, r)
+            } else {
+                (ProxyKind::Http, s)
+            };
+        // userinfo（user:pass@host:port）；避免把 host 里的 '@' 误伤
+        let (auth, hostport) = match rest.rfind('@') {
+            Some(i) if !rest[..i].contains('/') => (Some(&rest[..i]), &rest[i + 1..]),
+            _ => (None, rest),
+        };
+        let (user, pass) = match auth {
+            Some(a) => match a.split_once(':') {
+                Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
+                None => (Some(a.to_string()), None),
+            },
+            None => (None, None),
+        };
+        let hostport = hostport.trim_end_matches('/');
+        let default_port = if kind == ProxyKind::Socks5 { 1080 } else { 8080 };
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => {
+                let port: u16 =
+                    p.parse().map_err(|_| fatal("proxy", format!("代理端口不合法: {p}")))?;
+                (h.trim_matches(|c| c == '[' || c == ']').to_string(), port)
+            }
+            None => (hostport.trim_matches(|c| c == '[' || c == ']').to_string(), default_port),
+        };
+        if host.is_empty() {
+            return Err(fatal("proxy", "代理缺少主机"));
+        }
+        let bad = has_ctl(&host)
+            || user.as_deref().map(has_ctl).unwrap_or(false)
+            || pass.as_deref().map(has_ctl).unwrap_or(false);
+        if bad {
+            return Err(fatal("proxy", "代理含非法控制字符（CR/LF 等）"));
+        }
+        Ok(ProxyConfig { kind, host, port, user, pass })
+    }
+
+    fn http_authorization(&self) -> Option<String> {
+        let u = self.user.as_deref()?;
+        let p = self.pass.as_deref().unwrap_or("");
+        Some(format!("Basic {}", base64(&format!("{u}:{p}"))))
+    }
+}
+
+/// 极简 base64（仅用于 HTTP 代理 Basic 认证）。
+fn base64(input: &str) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// 通过 HTTP 代理建立到 `host:port` 的 CONNECT 隧道（HTTPS 目标用）。
+fn http_proxy_connect(stream: &mut TcpStream, p: &ProxyConfig, host: &str, port: u16) -> Result<()> {
+    let host_disp = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+    let mut req = format!("CONNECT {host_disp}:{port} HTTP/1.1\r\nHost: {host_disp}:{port}\r\n");
+    if let Some(a) = p.http_authorization() {
+        req.push_str(&format!("Proxy-Authorization: {a}\r\n"));
+    }
+    req.push_str("Proxy-Connection: keep-alive\r\n\r\n");
+    stream.write_all(req.as_bytes()).map_err(|e| map_io("proxy", e))?;
+    stream.flush().map_err(|e| map_io("proxy", e))?;
+    // 代理的 CONNECT 响应没有 body：逐字节读到空行
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).map_err(|e| map_io("proxy", e))?;
+        if n == 0 {
+            return Err(retryable("proxy", "代理在 CONNECT 后关闭了连接"));
+        }
+        buf.push(byte[0]);
+        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+            break;
+        }
+        if buf.len() > 16 * 1024 {
+            return Err(fatal("proxy", "代理 CONNECT 响应头过大"));
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let first = head.lines().next().unwrap_or("");
+    let code: u16 = first.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    if !(200..300).contains(&code) {
+        return Err(fatal("proxy", format!("代理 CONNECT 失败: {first}")));
+    }
+    Ok(())
+}
+
+/// 通过 SOCKS5 代理建立到 `host:port` 的隧道（域名交给代理解析）。
+fn socks5_connect(stream: &mut TcpStream, p: &ProxyConfig, host: &str, port: u16) -> Result<()> {
+    if host.len() > 255 {
+        return Err(fatal("proxy", "SOCKS5 目标主机名过长"));
+    }
+    let mut methods = vec![0x00u8];
+    if p.user.is_some() {
+        methods.insert(0, 0x02);
+    }
+    let mut greet = vec![0x05u8, methods.len() as u8];
+    greet.extend_from_slice(&methods);
+    stream.write_all(&greet).map_err(|e| map_io("proxy", e))?;
+    let mut resp = [0u8; 2];
+    stream.read_exact(&mut resp).map_err(|e| map_io("proxy", e))?;
+    if resp[0] != 0x05 {
+        return Err(fatal("proxy", "SOCKS5 版本不匹配"));
+    }
+    match resp[1] {
+        0x00 => {}
+        0x02 => {
+            let u = p.user.as_deref().unwrap_or("");
+            let pw = p.pass.as_deref().unwrap_or("");
+            if u.len() > 255 || pw.len() > 255 {
+                return Err(fatal("proxy", "SOCKS5 账号/密码过长"));
+            }
+            let mut auth = vec![0x01u8, u.len() as u8];
+            auth.extend_from_slice(u.as_bytes());
+            auth.push(pw.len() as u8);
+            auth.extend_from_slice(pw.as_bytes());
+            stream.write_all(&auth).map_err(|e| map_io("proxy", e))?;
+            let mut ar = [0u8; 2];
+            stream.read_exact(&mut ar).map_err(|e| map_io("proxy", e))?;
+            if ar[1] != 0x00 {
+                return Err(fatal("proxy", "SOCKS5 认证失败"));
+            }
+        }
+        m => return Err(fatal("proxy", format!("SOCKS5 不支持的认证方式: {m}"))),
+    }
+    let mut req = vec![0x05u8, 0x01, 0x00, 0x03, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).map_err(|e| map_io("proxy", e))?;
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).map_err(|e| map_io("proxy", e))?;
+    if head[1] != 0x00 {
+        return Err(fatal("proxy", format!("SOCKS5 连接被拒（code {}）", head[1])));
+    }
+    // 读掉绑定地址（按 atyp 长度）
+    let skip = match head[3] {
+        0x01 => 4 + 2,
+        0x04 => 16 + 2,
+        0x03 => {
+            let mut l = [0u8; 1];
+            stream.read_exact(&mut l).map_err(|e| map_io("proxy", e))?;
+            l[0] as usize + 2
+        }
+        _ => 0,
+    };
+    if skip > 0 {
+        let mut buf = vec![0u8; skip];
+        stream.read_exact(&mut buf).map_err(|e| map_io("proxy", e))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,10 +1465,55 @@ mod tests {
             "UA\r\nX-Evil-UA: 1",
             &[("X-H".to_string(), "v\r\nX-Evil: 2".to_string())],
             None,
+            false,
         );
         // 不能凭 CR/LF 造出新的头行
         assert!(!out.contains("\r\nX-Evil-UA:"), "UA 注入未被拦: {out:?}");
         assert!(!out.contains("\r\nX-Evil:"), "自定义头注入未被拦: {out:?}");
         assert!(out.contains("User-Agent: UAX-Evil-UA: 1"));
+    }
+
+    #[test]
+    fn proxy_config_parses_schemes_and_auth() {
+        let p = ProxyConfig::parse("http://user:secret@127.0.0.1:8080").unwrap();
+        assert_eq!(p.kind, ProxyKind::Http);
+        assert_eq!(p.host, "127.0.0.1");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.user.as_deref(), Some("user"));
+        assert_eq!(p.pass.as_deref(), Some("secret"));
+        assert_eq!(p.http_authorization().as_deref(), Some("Basic dXNlcjpzZWNyZXQ="));
+
+        let s = ProxyConfig::parse("socks5://127.0.0.1:1080").unwrap();
+        assert_eq!(s.kind, ProxyKind::Socks5);
+        assert_eq!(s.port, 1080);
+        assert!(s.user.is_none());
+
+        let bare = ProxyConfig::parse("proxy.local:3128").unwrap();
+        assert_eq!(bare.kind, ProxyKind::Http);
+        assert_eq!(bare.host, "proxy.local");
+        assert_eq!(bare.port, 3128);
+
+        assert!(ProxyConfig::parse("http://1.2.3.4:99999").is_err());
+        // 日志/调试不能泄露密码
+        let dbg = format!("{:?}", ProxyConfig::parse("http://u:secretpw@h:1").unwrap());
+        assert!(!dbg.contains("secretpw"), "Debug 不应含明文密码: {dbg}");
+    }
+
+    #[test]
+    fn proxy_request_line_uses_absolute_form() {
+        let u = parse_url("http://h/x?a=1").unwrap();
+        let abs = build_request(&u, "UA", &[], None, true);
+        assert!(abs.starts_with("GET http://h/x?a=1 HTTP/1.1\r\n"), "{abs:?}");
+        let rel = build_request(&u, "UA", &[], None, false);
+        assert!(rel.starts_with("GET /x?a=1 HTTP/1.1\r\n"), "{rel:?}");
+    }
+
+    #[test]
+    fn base64_encodes_known_vectors() {
+        assert_eq!(base64(""), "");
+        assert_eq!(base64("f"), "Zg==");
+        assert_eq!(base64("fo"), "Zm8=");
+        assert_eq!(base64("foo"), "Zm9v");
+        assert_eq!(base64("foobar"), "Zm9vYmFy");
     }
 }
