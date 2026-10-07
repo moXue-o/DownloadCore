@@ -454,6 +454,7 @@ pub unsafe extern "C" fn dc_engine_download(
                         }
                     }) as Box<dyn Fn(LogEntry) + Send + Sync>
                 }),
+                on_parts: None,
             };
 
             e.engine

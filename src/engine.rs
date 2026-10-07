@@ -5,7 +5,7 @@ use crate::limiter::Limiter;
 use crate::part::{Part, SAFETY_STEP};
 use crate::split::split_to_range;
 use crate::store::{self, PartState, ResumeState, STATE_FILE_NAME};
-use crate::types::{Callbacks, DownloadResult, Progress, Request, Status};
+use crate::types::{Callbacks, DownloadResult, PartProgress, Progress, Request, Status};
 use crate::util::{job_key, Lock};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -446,6 +446,7 @@ impl Engine {
         if let Some(cb) = &shared.cbs.on_progress {
             cb(Progress { downloaded: size, total: size, speed, parts: n_segments });
         }
+        shared.emit_parts();
         Ok(DownloadResult {
             path: final_path.display().to_string(),
             size: if size > 0 { size } else { downloaded },
@@ -803,6 +804,29 @@ impl Shared {
         }
     }
 
+    /// 取一份分段快照（与 save_state 同源，只读）。
+    fn snapshot_parts(&self) -> Vec<PartProgress> {
+        self.parts
+            .lock()
+            .iter()
+            .map(|p| {
+                let p = p.lock();
+                let mut cur = p.current;
+                if cur > p.to {
+                    cur = p.to + 1;
+                }
+                PartProgress { from: p.from, to: p.to, current: cur }
+            })
+            .collect()
+    }
+
+    /// 触发分段回调（若宿主提供了 on_parts）。
+    fn emit_parts(&self) {
+        if let Some(cb) = &self.cbs.on_parts {
+            cb(self.snapshot_parts());
+        }
+    }
+
     fn add_downloaded(&self, n: i64) {
         self.session_bytes.fetch_add(n, Ordering::SeqCst);
         let total = self.downloaded.fetch_add(n, Ordering::SeqCst) + n;
@@ -820,6 +844,7 @@ impl Shared {
         let speed = if dt > 0.0 { (delta as f64 / dt) as i64 } else { 0 };
         let parts = self.parts.lock().len();
         cb(Progress { downloaded: total, total: self.total.load(Ordering::SeqCst), speed, parts });
+        self.emit_parts();
     }
 
     fn save_state(&self, temp_dir: &Path) {

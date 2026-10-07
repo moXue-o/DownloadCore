@@ -106,6 +106,7 @@ println!("完成：{}（{} 字节）", res.path, res.size);
 - **取消 / 暂停**：把 `Request.cancel` / `Request.pause`（`Arc<AtomicBool>`）从别的线程置位。
 - **防静默损坏**：`Request.expected_sha256` 给了期望值，下完在**改名之前**核对。
 - **回调线程安全**：`Callbacks` 会被多个工人线程并发调用。
+- **分段进度（可选）**：`Callbacks.on_parts` 与进度同频回调每一段的 `[from, to, current]`（`PartProgress`），可用于绘制"每段进度"；不关心分段留空即可。
 
 ## C ABI 集成
 
